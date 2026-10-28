@@ -101,6 +101,8 @@ ESTIMATE_UNDERLINES = True  # fallback when an app hides its caret: approximate 
 FALLBACK_CHAR_W = 8.0       # px per character used by the estimate (tune to your font size)
 FALLBACK_LINE_H = 22        # px line height used by the estimate
 MAX_UNDERLINES = 24
+PASTE_PROBE_SECONDS = 1.5   # idle: try to read the field's full text (Windows)
+FULLTEXT_COOLDOWN = 12      # don't retry a failed clipboard probe this often
 
 
 def dbg(*a):
@@ -942,6 +944,7 @@ if WIN:
     user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+    kernel32 = ctypes.windll.kernel32
 
     class GUITHREADINFO(ctypes.Structure):
         _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
@@ -1247,6 +1250,8 @@ class Assistant:
         self.injecting = False
         self.mods = set()
         self.anchor = None         # last click position (for estimated underlines)
+        self._fulltext_at = 0.0    # when we last probed the whole field
+        self._fulltext_len = -1    # buffer length after the last successful grab
         self.sample_q = queue.Queue()
         threading.Thread(target=self._worker, daemon=True).start()
 
@@ -1268,6 +1273,7 @@ class Assistant:
             self.text, self.issues, self.selected = "", [], None
             self.samples.clear()
             self.checked_upto, self.flushed_len = 0, -1
+            self._fulltext_at, self._fulltext_len = time.time(), -1
         self.sample_q.put(0)           # caret position after a click/nav = start of buffer
         if had:
             self.notify()
@@ -1386,6 +1392,11 @@ class Assistant:
                 if c.isspace():
                     self._analyze_range(self.checked_upto, n)
                     self.checked_upto = n
+                elif n == 2 and c.isalpha() and self.text[0].islower() \
+                        and self.text[1].isupper():
+                    # you started typing mid-sentence ("hello." -> "Hello.")
+                    self._add("style", "Capitalize first word of sentence",
+                              0, 1, 0, 1, [(self.text[0].upper(), self.text[0].upper())])
                 self.sample_q.put(n)
             self._fix_selected()
         self.notify()
@@ -1412,6 +1423,133 @@ class Assistant:
             self.reset()
         else:
             self.type_char("\n")
+
+    # ---------------- whole-field text grab (pasted / pre-existing text)
+    def _clip_get(self):
+        """Current clipboard text ("" on any failure)."""
+        try:
+            if WIN:
+                CF_UNICODETEXT, GMEM_MOVEABLE = 13, 0x0002
+                user32.OpenClipboard(0)
+                try:
+                    if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+                        return ""
+                    h = user32.GetClipboardData(CF_UNICODETEXT)
+                    if not h:
+                        return ""
+                    p = kernel32.GlobalLock(h)
+                    try:
+                        buf = ctypes.wstring_at(p)
+                    finally:
+                        kernel32.GlobalUnlock(h)
+                    return buf
+                finally:
+                    user32.CloseClipboard()
+            import pyperclip
+            try:
+                return pyperclip.paste() or ""
+            except Exception:
+                pass
+            if not MAC:
+                for tool in ("wl-paste", "xclip -selection clipboard -o", "xsel --clipboard"):
+                    try:
+                        out = subprocess.check_output(tool.split(), timeout=0.4,
+                                                      stderr=subprocess.DEVNULL)
+                        return out.decode("utf-8", "ignore")
+                    except Exception:
+                        continue
+            return ""
+        except Exception as ex:
+            dbg("clip get failed:", ex)
+            return ""
+
+    def _clip_set(self, s):
+        try:
+            if WIN:
+                CF_UNICODETEXT, GMEM_MOVEABLE = 13, 0x0002
+                data = (s + "\0").encode("utf-16-le")
+                h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                p = kernel32.GlobalLock(h)
+                ctypes.memmove(p, data, len(data))
+                kernel32.GlobalUnlock(h)
+                user32.EmptyClipboard()
+                user32.SetClipboardData(CF_UNICODETEXT, h)   # system owns h now
+                return True
+            import pyperclip
+            pyperclip.copy(s)
+            return True
+        except Exception as ex:
+            dbg("clip set failed:", ex)
+            return False
+
+    def _grab_full_text(self):
+        """Best-effort read of the ENTIRE current field via a copy round-trip.
+
+        On Windows we use the Win32 clipboard API directly (no third-party
+        dependency); elsewhere we use pyperclip if installed.  The user's own
+        clipboard is saved and restored.  Returns None when the probe cannot be
+        trusted (nothing copied, clipboard unavailable, macOS needs Accessibility
+        permissions we can't verify here).
+        """
+        if MAC:
+            return None
+        with self.apply_lock:
+            self.injecting = True
+            try:
+                deadline = time.time() + 2
+                while self.mods and time.time() < deadline:
+                    time.sleep(0.02)
+                if self.mods:
+                    return None
+                saved = self._clip_get()
+                clip_ok = bool(saved) or self._clip_set("WA_PROBE")
+                if not clip_ok:
+                    return None
+                marker = saved if saved else "WA_PROBE"
+                self.kb.tap(keyboard.Key.ctrl, "a")
+                time.sleep(0.05)
+                self.kb.tap(keyboard.Key.ctrl, "c")
+                time.sleep(0.12)
+                got = self._clip_get()
+                if got == marker or not got:
+                    return None          # app never wrote the clipboard
+                self._clip_set(saved)    # restore whatever the user had copied
+                return got[:MAX_TEXT * 2]
+            finally:
+                self.kb.tap(keyboard.Key.right)   # deselect so typing stays normal
+                time.sleep(0.03)
+                self.injecting = False
+
+    def _try_full_grab(self):
+        """Idle hook: analyse the whole field, not just what was typed live."""
+        if self._fulltext_len >= 0:
+            return                       # already grabbed this visit to the field
+        self._fulltext_at = time.time()
+        got = self._grab_full_text()
+        if got is None:
+            self._fulltext_at = time.time() - PASTE_PROBE_SECONDS + FULLTEXT_COOLDOWN
+            dbg("full-text probe failed; will retry after cooldown")
+            return
+        got = got.replace("\r\n", "\n").replace("\r", "\n")
+        changed = False
+        with self.lock:
+            if got != self.text:
+                self.text = got[-MAX_TEXT:]
+                cut = max(0, len(got) - MAX_TEXT)
+                self.issues = []
+                self.selected = None
+                self.next_id = 1
+                self.samples.clear()
+                self.checked_upto = 0
+                self._fulltext_len = len(self.text)
+                if cut == 0:
+                    self._analyze_range(0, len(self.text))
+                changed = True
+        if changed:
+            dbg("adopted full field text:", len(got), "chars")
+            n = len(self.text)
+            self.sample_q.put(n)
+            self.notify()
 
     def _trim(self):
         if len(self.text) <= MAX_TEXT:
@@ -1470,21 +1608,89 @@ class Assistant:
             return
         self._add("punct", f"Missing space after “{p}”", n - 1, n - 1, n - 3, n, [("add a space", " ")])
 
+    def _rule_capitalization(self):
+        """Whole-text pass: sentence starts and standalone "I" must be capitalized.
+
+        Runs on every analysis flush so it also catches text that was pasted or
+        typed before we started tracking - not just what the engine saw live.
+        """
+        t = self.text
+        for m in re.finditer(r"[A-Za-z]+(?:['’][A-Za-z]+)*", t):
+            s, e = m.span()
+            w = m.group(0)
+            lw = w.lower().replace("’", "'")
+            if lw in self.ignored or lw in self.user_words:
+                continue
+            if any(i.hs <= s < i.he for i in self.issues):
+                continue                       # already flagged by a stronger rule
+            if w == "i" and s > 0 and not t[s - 1].isalnum():
+                self._add("grammar", "Capitalize “I”", s, e, s, e, [("I", "I")])
+                continue
+            if w[0] == "i" and lw in ("i'm", "i've", "i'll", "i'd"):
+                fix = "I" + w[1:]
+                self._add("grammar", "Capitalize “I”", s, e, s, e, [(fix, fix)])
+                continue
+            if not w[0].islower() or len(w) < 2:
+                continue                       # only plain lowercase words can start sentences
+            if not self._sentence_start(s):
+                continue
+            fix = w[0].upper() + w[1:]
+            self._add("style", "Capitalize first word of sentence", s, e, s, e,
+                      [(fix, fix)])
+
     def _analyze_range(self, a, b):
+        """Run every rule over the freshly-finished span [a, b).
+
+        The whole-text passes (capitalisation) see the entire buffer, so pasted
+        or previously-typed text gets checked too; the local passes only rescan
+        the new window plus the word before it (cross-boundary phrases such as
+        "have went" need that context).
+        """
+        # clamp to finished words: never analyse a half-typed trailing token
+        e = min(b, len(self.text))
+        while e > a and e == len(self.text) and not self.text[e - 1].isspace():
+            e -= 1
+        if e > a:
+            self._analyze_window(a, e)
+        self.checked_upto = max(self.checked_upto, e)
+        self._rule_capitalization()          # whole-text pass (pasted text included)
+
+    def _analyze_window(self, a, b):
         t = self.text
         # --- phrase rules (confusions / redundancy / officialisms) over the window.
-        # extend the scan left by one word so cross-boundary phrases like
-        # "have went" still match when "have " was consumed on an earlier pass.
+        # extend the scan left by two words so cross-boundary phrases like
+        # "should of went" / "have went" still match when the earlier words were
+        # consumed on a previous pass.
         lo = a
-        while lo > 0 and not t[lo - 1].isspace():
-            lo -= 1
-        if lo > 0:
-            k = lo - 1
-            while k > 0 and not t[k - 1].isspace():
-                k -= 1
-            prev_tok = t[k:lo - 1]
-            if len(prev_tok) <= 24 and all(ch.isalpha() or ch in "'’-." for ch in prev_tok):
-                lo = k          # rescan the previous word too (dedup makes this cheap)
+        for _ in range(2):
+            while lo > 0 and not t[lo - 1].isspace():
+                lo -= 1
+            if lo > 0:
+                k = lo - 1
+                while k > 0 and not t[k - 1].isspace():
+                    k -= 1
+                prev_tok = t[k:lo - 1]
+                if len(prev_tok) <= 24 and all(ch.isalpha() or ch in "'’-." for ch in prev_tok):
+                    lo = k      # rescan the previous word too (dedup makes this cheap)
+        # treat line breaks as spaces for this pass so pasted multi-line text
+        # analyses as continuous prose ("...went\nthere" still matches "went there")
+        nl_positions = [i for i, ch in enumerate(self.text) if ch in "\r\n"]
+        if nl_positions:
+            t = self.text
+            for i in nl_positions:
+                t = t[:i] + " " + t[i + 1:]
+            self.text = t
+        try:
+            self._window_rules(a, b, lo)
+        finally:
+            if nl_positions:
+                t = self.text
+                for i in nl_positions:
+                    t = t[:i] + "\n" + t[i + 1:]
+                self.text = t
+
+    def _window_rules(self, a, b, lo):
+        t = self.text
         for phrase, repl in _PHRASE_RULES:
             i = max(lo - len(phrase), 0)
             seen_here = set()
@@ -1510,6 +1716,8 @@ class Assistant:
         # --- per-token word rules
         for m in re.finditer(r"\S+", t[a:b]):
             self._analyze_token(a + m.start(), a + m.end())
+        # --- whole-text capitalisation pass (catches pasted text too)
+        self._rule_capitalization()
 
     def _add_phrase(self, phrase, repl, j, k):
         kind = "grammar" if phrase in STRONG_CONFUSIONS else "style"
@@ -1550,8 +1758,16 @@ class Assistant:
         i = s - 1
         while i >= 0 and t[i] in "\"'“‘([":
             i -= 1
-        if i < 0 or not t[i].isspace():
+        if i < 0:
+            return True                      # very first word of the field
+        if not t[i].isspace():
             return False
+        if "\n" in t[max(0, i - 3):i + 1]:
+            return True                      # right after a line break
+        while i >= 0 and t[i].isspace():
+            i -= 1
+        if i < 0:
+            return True                      # only whitespace before it
         while i >= 0 and t[i].isspace():
             i -= 1
         if i < 0 or t[i] not in ".!?":
@@ -1640,10 +1856,8 @@ class Assistant:
             return                                   # acronyms, CamelCase, iPhone ...
         known = bool(spell.known([lw])) if spell is not None else (lw in CORE_WORDS)
         if lw in SLANG_OK or known:
-            if strict_start and w[0].islower():
-                fix = w[0].upper() + w[1:]
-                self._add("style", "Capitalize first word of sentence", s, e, s, e, [(fix, fix)])
-                return
+            # sentence-start capitalisation is handled by the whole-text pass
+            # _rule_capitalization(), which also covers pasted text.
             self._style_word(s, e, lw, w)
             return
         if w[0].isupper() and not (strict_start or s == 0 or t[s - 1] == "\n"):
@@ -1738,17 +1952,24 @@ class Assistant:
 
     def _idle_check(self):
         with self.lock:
-            if self.paused or not self.text or time.time() - self.last_key < IDLE_FLUSH_SECONDS:
+            if self.paused or time.time() - self.last_key < IDLE_FLUSH_SECONDS:
                 return
-            if self.flushed_len == len(self.text):
-                return
-            self.flushed_len = len(self.text)
-            if self.checked_upto < len(self.text):
-                self._analyze_range(self.checked_upto, len(self.text))
-            self._fix_selected()
-            n = len(self.text)
-        self.sample_q.put(n)
-        self.notify()
+            fresh = bool(self.text) and self.flushed_len != len(self.text)
+            if fresh:
+                self.flushed_len = len(self.text)
+                if self.checked_upto < len(self.text):
+                    self._analyze_range(self.checked_upto, len(self.text))
+                self._fix_selected()
+                n = len(self.text)
+            else:
+                n = None
+            empty_field = not self.text
+        if fresh:
+            self.sample_q.put(n)
+            self.notify()
+        elif empty_field and time.time() - self.last_key > PASTE_PROBE_SECONDS \
+                and self._fulltext_len < 0:
+            self._try_full_grab()        # e.g. the user pasted without typing
 
     # ---------------- applying fixes
     def apply_selected(self, idx):
@@ -1910,6 +2131,7 @@ class Keys:
             m.backspace()
         elif key == keyboard.Key.enter:
             m.enter()
+            threading.Thread(target=m._try_full_grab, daemon=True).start()
         elif getattr(key, "char", None):
             if key.char.isprintable():
                 m.type_char(key.char)
