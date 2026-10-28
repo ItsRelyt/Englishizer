@@ -1233,10 +1233,17 @@ class Assistant:
         self.apply_lock = threading.Lock()
         self.kb = keyboard.Controller()
         self.text = ""
+        self.caret = 0             # model cursor: where the NEXT keystroke lands
+                                   # (moves left/right with arrows/Home/End so we can
+                                   #  follow mid-text edits instead of resetting)
+        self._last_nav = 0.0       # when we last saw a cursor-moving key
+        self._dirty = set()        # (start, end) regions edited mid-text, awaiting re-scan
         self.issues = []
         self.selected = None
         self.samples = {}          # text index -> (x, y, h, ox, oy) caret samples
-        self.checked_upto = 0
+        self.checked_upto = 0      # [deprecated] kept for reference; analysis now
+                                   # re-scans around every edit instead of trusting
+                                   # a single forward watermark
         self.flushed_len = -1
         self.last_key = 0.0
         self.next_id = 1
@@ -1271,12 +1278,48 @@ class Assistant:
             self.anchor = anchor
             had = bool(self.issues or self.text)
             self.text, self.issues, self.selected = "", [], None
+            self.caret = 0
+            self._dirty.clear()
             self.samples.clear()
             self.checked_upto, self.flushed_len = 0, -1
             self._fulltext_at, self._fulltext_len = time.time(), -1
         self.sample_q.put(0)           # caret position after a click/nav = start of buffer
         if had:
             self.notify()
+
+    def forget(self):
+        """Drop the tracked buffer but KEEP the issues already found.
+
+        Used when a cursor-navigation key (Home/End/PageUp/PageDown...) moves the
+        caret somewhere we can't track: the marks stay on screen and stay fixable
+        (fixes are re-anchored by _do_apply's live text verification), but no new
+        keystroke is attributed to the old buffer until the next click / window
+        switch / Enter actually resets it.  This is what makes editing EARLIER in
+        a document safe: nothing you do mid-text wipes the card anymore.
+        """
+        with self.lock:
+            self.text = ""
+            self.caret = 0
+            self._dirty.clear()
+            self.samples.clear()
+            self.checked_upto, self.flushed_len = 0, -1
+        self.notify()
+
+    def move_caret(self, delta):
+        """Arrow keys: slide the model cursor so edits land in the right place."""
+        with self.lock:
+            if self.paused or not self.text:
+                return
+            n = len(self.text)
+            new = max(0, min(n, self.caret + delta))
+            if new == self.caret:
+                return
+            self.caret = new
+            self.last_key = time.time()
+            self.flushed_len = -1
+            self._last_nav = self.last_key
+        self.sample_q.put(new)         # sample the real caret at the new position
+        self.notify()
 
     def drop_rects(self):
         with self.lock:
@@ -1372,32 +1415,39 @@ class Assistant:
 
     # ---------------- keystroke input
     def type_char(self, c):
+        """Insert a typed character AT THE MODEL CURSOR (not always at the end).
+
+        This is the core of the "edit earlier in the text" fix: when you move the
+        caret left with the arrow keys and keep typing, the buffer follows your
+        real cursor instead of pretending every keystroke lands at the end -
+        which used to desync everything and make the app shove the position
+        forward (reset) the moment you touched older text.
+        """
         with self.lock:
             if self.paused:
                 return
-            self.last_key = time.time()
+            now = time.time()
+            self.last_key = now
             self.flushed_len = -1
             n0 = len(self.text)
+            p = max(0, min(self.caret, n0))
             if is_word_char(c):   # word is being extended -> its old verdict is stale
-                self.issues = [i for i in self.issues if not (i.kind in WORD_KINDS and i.he == n0)]
-            self.text += c
+                self.issues = [i for i in self.issues
+                               if not (i.kind in WORD_KINDS and i.he == p)]
+            self.text = self.text[:p] + c + self.text[p:]
+            self.caret = p + 1
+            self._shift_issues(p, 1, exclude=None)
             self._trim()
-            n = len(self.text)
             if is_word_char(c):
-                self._rule_missing_space(c)
-                if n == 1:
-                    self.sample_q.put(1)
+                self._rule_missing_space(c, p)
             else:
-                self._rule_punct(c)
-                if c.isspace():
-                    self._analyze_range(self.checked_upto, n)
-                    self.checked_upto = n
-                elif n == 2 and c.isalpha() and self.text[0].islower() \
-                        and self.text[1].isupper():
-                    # you started typing mid-sentence ("hello." -> "Hello.")
-                    self._add("style", "Capitalize first word of sentence",
-                              0, 1, 0, 1, [(self.text[0].upper(), self.text[0].upper())])
-                self.sample_q.put(n)
+                self._rule_punct(c, p)
+            # Re-analyse the sentence/word AROUND the edit after a short idle
+            # (_idle_check -> _flush), so fixing something early in the text no
+            # longer depends on a forward-only watermark that refuses to look
+            # backwards (the old cause of stale marks and lost suggestions).
+            self._rescan_around(p)
+            self.sample_q.put(self.caret)
             self._fix_selected()
         self.notify()
 
@@ -1407,16 +1457,103 @@ class Assistant:
                 return
             self.last_key = time.time()
             self.flushed_len = -1
-            self.text = self.text[:-1]
-            n = len(self.text)
-            self.issues = [i for i in self.issues if i.he <= n and i.e <= n]
-            self.samples = {k: v for k, v in self.samples.items() if k <= n}
-            ts = n
-            while ts > 0 and not self.text[ts - 1].isspace():
-                ts -= 1
-            self.checked_upto = min(self.checked_upto, ts)
+            p = max(0, min(self.caret, len(self.text)))
+            if p > 0:
+                q = p - 1
+                self.text = self.text[:q] + self.text[p:]
+                self.caret = q
+                self._drop_issue_span(q, p)
+                self._shift_issues(q, -1, exclude=None)
+                ts = q
+                while ts > 0 and not self.text[ts - 1].isspace():
+                    ts -= 1
+                self._rescan_around(ts)
+            self.samples = {k: v for k, v in self.samples.items() if k <= len(self.text)}
+            self.sample_q.put(self.caret)
             self._fix_selected()
         self.notify()
+
+    def delete_fwd(self):
+        """Delete key: remove the character AFTER the model cursor."""
+        with self.lock:
+            if self.paused or not self.text:
+                return
+            self.last_key = time.time()
+            self.flushed_len = -1
+            p = max(0, min(self.caret, len(self.text)))
+            if p < len(self.text):
+                self.text = self.text[:p] + self.text[p + 1:]
+                self._drop_issue_span(p, p + 1)
+                self._shift_issues(p, -1, exclude=None)
+                ts = p
+                while ts > 0 and not self.text[ts - 1].isspace():
+                    ts -= 1
+                self._rescan_around(ts)
+            self.samples = {k: v for k, v in self.samples.items() if k <= len(self.text)}
+            self.sample_q.put(self.caret)
+            self._fix_selected()
+        self.notify()
+
+    # ---- mid-text-edit bookkeeping helpers (call with self.lock held)
+    def _shift_issues(self, pos, delta, exclude=None):
+        """Slide issue spans across an insertion/deletion at ``pos``.
+
+        Issues fully BEFORE the edit keep their coordinates - they stay valid and
+        fixable even though the user is now typing somewhere later.  Issues fully
+        AFTER it shift by ``delta`` so underlines and previews keep tracking the
+        text.  Anything overlapping the edit point is dropped (stale)."""
+        if delta == 0:
+            return
+        keep = []
+        for i in self.issues:
+            if exclude is not None and i.id == exclude.id:
+                keep.append(i)
+                continue
+            if i.e <= pos and i.he <= pos:
+                keep.append(i)                       # untouched, still accurate
+            elif i.s >= pos and i.hs >= pos:
+                i.s += delta; i.e += delta
+                i.hs += delta; i.he += delta
+                if delta < 0 and (i.e < i.s or i.he < i.hs):
+                    continue                         # swallowed by the deletion
+                if i.rect:
+                    i.rect = None                    # re-projected from fresh samples
+                keep.append(i)
+            # overlapping the edit -> verdict is stale, drop it
+        self.issues = keep
+
+    def _drop_issue_span(self, a, b):
+        self.issues = [i for i in self.issues if not (i.e <= a and i.he <= a)
+                       and not (i.s >= b and i.hs >= b)
+                       and not (i.s < b and i.e > a)]
+
+    def _rescan_around(self, pos):
+        """Remember the sentence around a mid-text edit for the next idle flush."""
+        t = self.text
+        lo = pos
+        while lo > 0 and t[lo - 1] not in ".!?\n":
+            lo -= 1
+        hi = pos
+        n = len(t)
+        while hi < n and t[hi] not in ".!?\n":
+            hi += 1
+        while hi < n and t[hi] in ".!?\n ":
+            hi += 1
+        self._dirty.add((max(0, lo - 60), min(n, hi + 2)))
+
+    def _flush_dirty(self):
+        """Re-run the rule engine over every region edited since the last flush."""
+        regions = sorted(self._dirty)
+        self._dirty.clear()
+        merged = []
+        for a, b in regions:
+            if merged and a <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        for a, b in merged:
+            if b > a:
+                self._analyze_window(a, b)
 
     def enter(self):
         if ENTER_RESETS:
@@ -1582,31 +1719,41 @@ class Assistant:
         self._update_rect(iss)
         dbg("issue", kind, repr(word), [x[0] for x in suggs])
 
-    def _rule_punct(self, c):
-        t, n = self.text, len(self.text)
-        if c == " " and FLAG_DOUBLE_SPACE and n >= 3 and t[n - 2] == " " and t[n - 3] not in " \t\n.!?":
-            self._add("punct", "Extra space", n - 1, n, n - 2, n, [("remove extra space", "")])
-        if c in ",.!?;" and n >= 3 and t[n - 2] == " " and (t[n - 3].isalnum() or t[n - 3] in ")\"'”’"):
-            self._add("punct", f"Space before “{c}”", n - 2, n - 1, n - 2, n, [("remove space", "")])
-        if c == "," and n >= 2 and t[n - 2] == ",":
-            self._add("punct", "Repeated comma", n - 1, n, n - 2, n, [("remove extra comma", "")])
+    def _rule_punct(self, c, p):
+        """Punctuation rules for the char just inserted at index ``p`` (caret = p+1)."""
+        t = self.text
+        i = p                                   # index of the freshly typed char
+        if c == " " and FLAG_DOUBLE_SPACE and i >= 2 and t[i - 1] == " " \
+                and t[i - 2] not in " \t\n.!?":
+            self._add("punct", "Extra space", i, i + 1, i - 1, i + 1,
+                      [("remove extra space", "")])
+        if c in ",.!?" and i >= 2 and t[i - 1] == " " \
+                and (t[i - 2].isalnum() or t[i - 2] in ")\u2019\"\u201d'"):
+            self._add("punct", f"Space before “{c}”", i - 1, i, i - 1, i + 1,
+                      [("remove space", "")])
+        if c == "," and i >= 1 and t[i - 1] == ",":
+            self._add("punct", "Repeated comma", i, i + 1, i - 1, i + 1,
+                      [("remove extra comma", "")])
 
-    def _rule_missing_space(self, c):
-        t, n = self.text, len(self.text)
-        if n < 3 or not c.isalpha() or not t[n - 3].isalpha():
+    def _rule_missing_space(self, c, p):
+        """Detect 'Hello.World' style missing spaces around the insertion at ``p``."""
+        t = self.text
+        i = p
+        if not c.isalpha() or i < 2 or not t[i - 2].isalpha():
             return
-        p = t[n - 2]
-        ok = p in ",;!?" or (p == "." and c.isupper() and t[n - 3].islower()
-                             and n >= 5 and t[n - 4].isalpha() and t[n - 5].isalpha())
+        ch = t[i - 1]
+        ok = ch in ",;!?" or (ch == "." and c.isupper() and t[i - 2].islower()
+                              and i >= 4 and t[i - 3].isalpha() and t[i - 4].isalpha())
         if not ok:
             return
-        a = n
+        a = i + 1
         while a > 0 and not t[a - 1].isspace():
             a -= 1
-        tok = t[a:n]
-        if any(ch in SPECIAL or ch.isdigit() for ch in tok) or "://" in tok:
+        tok = t[a:i + 1]
+        if any(x in SPECIAL or x.isdigit() for x in tok) or "://" in tok:
             return
-        self._add("punct", f"Missing space after “{p}”", n - 1, n - 1, n - 3, n, [("add a space", " ")])
+        self._add("punct", f"Missing space after \u201c{ch}\u201d", i, i, i - 2, i + 1,
+                  [("add a space", " ")])
 
     def _rule_capitalization(self):
         """Whole-text pass: sentence starts and standalone "I" must be capitalized.
@@ -1954,11 +2101,23 @@ class Assistant:
         with self.lock:
             if self.paused or time.time() - self.last_key < IDLE_FLUSH_SECONDS:
                 return
-            fresh = bool(self.text) and self.flushed_len != len(self.text)
+            fresh = bool(self.text) and (self.flushed_len != len(self.text)
+                                         or self._dirty)
             if fresh:
                 self.flushed_len = len(self.text)
-                if self.checked_upto < len(self.text):
-                    self._analyze_range(self.checked_upto, len(self.text))
+                # 1) re-scan every region edited mid-text (backspaces, arrow-key
+                #    edits in older sentences...) - this replaces the old
+                #    forward-only watermark that made early edits unsafe;
+                self._flush_dirty()
+                # 2) then analyse any new tail that hasn't been seen yet.
+                #    checked_upto is only trusted for pure appends: after a
+                #    mid-text edit it can sit past the true frontier, so clamp
+                #    it to the buffer end before using it.
+                c = min(self.checked_upto, len(self.text))
+                if c < len(self.text):
+                    self._analyze_range(c, len(self.text))
+                elif self._dirty:
+                    self._rule_capitalization()   # whole-text pass keeps marks fresh
                 self._fix_selected()
                 n = len(self.text)
             else:
@@ -2018,19 +2177,86 @@ class Assistant:
                             continue
                         s, e = iss.s, iss.e
                         n_left = len(self.text) - e
+                        expected = self.text[e:]     # what should sit right of the fix
                     dbg("apply", repr(iss.word), "->", repr(repl), "left", n_left, "del", e - s)
                     self._tap(keyboard.Key.left, n_left)
                     self._tap(keyboard.Key.backspace, e - s)
                     if repl:
                         self.kb.type(repl)
                     self._tap(keyboard.Key.right, n_left)
-                    with self.lock:
-                        self._after_fix(iss, repl)
+                    # ---- cursor safety net -------------------------------------------------
+                    # If the real caret was NOT where our model thought it was (the user
+                    # clicked / arrowed away a moment ago), the taps above landed at the
+                    # wrong spot and may have mangled the text. Detect that by comparing
+                    # what the field still holds to the right of the caret against the
+                    # snapshot taken before the edit; on mismatch, undo our keystrokes
+                    # and re-anchor the fix from the live clipboard text instead.
+                    if expected:
+                        probe = self._clip_get()
+                        bad = (probe is not None and probe != expected
+                               and not expected.endswith(probe)
+                               and not probe.startswith(expected[:12]))
+                        if bad:
+                            dbg("apply: caret mismatch, recovering")
+                            if repl:
+                                self._tap(keyboard.Key.backspace, len(repl))
+                            self._tap(keyboard.Key.delete, e - s)
+                            anchor = self._reanchor_from_clip(iss)
+                            if anchor is not None:
+                                with self.lock:
+                                    s, e = anchor
+                                    iss.s, iss.e = s, e
+                                    iss.hs, iss.he = s, e
+                                    iss.rect = None
+                                    n_left = max(0, len(self.text) - e)
+                                self._tap(keyboard.Key.left, n_left)
+                                self._tap(keyboard.Key.backspace, e - s)
+                                if repl:
+                                    self.kb.type(repl)
+                                self._tap(keyboard.Key.right, n_left)
+                            else:
+                                # can't verify the field - put the caret back where we
+                                # found it and leave the issue for the next flush
+                                self._tap(keyboard.Key.right, max(0, len(expected)))
+                                with self.lock:
+                                    self.issues = [i for i in self.issues
+                                                   if i.id != iss.id]
+                                    self.flushed_len = -1
+                                iss = None
+                    if iss:
+                        with self.lock:
+                            self._after_fix(iss, repl)
                 time.sleep(0.25)
             finally:
                 self.injecting = False
                 self.last_key = time.time()
         self.notify()
+
+    def _reanchor_from_clip(self, iss):
+        """Best-effort: find issue.word inside a live copy of the field.
+
+        Returns (s, e) in our buffer coordinate space, or None."""
+        got = self._grab_full_text()
+        if not got:
+            return None
+        got = got.replace("\r\n", "\n").replace("\r", "\n")
+        idx = got.find(iss.word)
+        if idx < 0:
+            return None
+        cut = max(0, len(got) - MAX_TEXT)
+        s = idx - cut
+        e = s + len(iss.word)
+        if s < 0:
+            return None
+        with self.lock:
+            if got[cut:] != self.text:      # adopt the live text as truth
+                self.text = got[cut:cut + MAX_TEXT]
+                self.caret = min(max(e, 0), len(self.text))
+                self.samples.clear()
+                self.checked_upto = 0
+                self._dirty.clear()
+                self.flushed_len = -1
+        return (s, e)
 
     def _after_fix(self, iss, repl):
         delta = len(repl) - (iss.e - iss.s)
