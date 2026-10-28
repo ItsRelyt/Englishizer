@@ -1356,7 +1356,8 @@ class Assistant:
 
     def toggle_pause(self):
         self.paused = not self.paused
-        self.reset()
+        if not self.paused:
+            self.reset()                 # resume: start tracking fresh
         self.toast("Paused" if self.paused else "Resumed")
 
     def _fix_selected(self):
@@ -1471,15 +1472,30 @@ class Assistant:
 
     def _analyze_range(self, a, b):
         t = self.text
-        # --- phrase rules (confusions / redundancy / officialisms) over the window
+        # --- phrase rules (confusions / redundancy / officialisms) over the window.
+        # extend the scan left by one word so cross-boundary phrases like
+        # "have went" still match when "have " was consumed on an earlier pass.
+        lo = a
+        while lo > 0 and not t[lo - 1].isspace():
+            lo -= 1
+        if lo > 0:
+            k = lo - 1
+            while k > 0 and not t[k - 1].isspace():
+                k -= 1
+            prev_tok = t[k:lo - 1]
+            if len(prev_tok) <= 24 and all(ch.isalpha() or ch in "'’-." for ch in prev_tok):
+                lo = k          # rescan the previous word too (dedup makes this cheap)
         for phrase, repl in _PHRASE_RULES:
-            i = max(a - len(phrase), 0)
+            i = max(lo - len(phrase), 0)
+            seen_here = set()
             while True:
                 j = t.lower().find(phrase, i, b + 1)
                 if j < 0:
                     break
                 k = j + len(phrase)
-                if (j == 0 or not is_word_char(t[j - 1])) and (k >= len(t) or not is_word_char(t[k])):
+                if (j == 0 or not is_word_char(t[j - 1])) and (k >= len(t) or not is_word_char(t[k])) \
+                        and j not in seen_here:
+                    seen_here.add(j)
                     self._add_phrase(phrase, repl, j, k)
                 i = j + 1
         # --- passive voice: be-verb + past participle (+ "by")
@@ -1588,11 +1604,18 @@ class Assistant:
                     self._add("grammar", f"Past participle: “{lw}” → “{PARTICIPLES[lw]}”",
                               s, e, s, e, [(fix, fix)])
                     return
-            if pl in MODALS and lw.endswith("s") and len(lw) > 3 \
-                    and lw[:-1] in CORE_WORDS and spell is not None and spell.known([lw[:-1]]):
-                fix = match_case(w, lw[:-1])
-                self._add("grammar", "Use the base verb after a modal", s, e, s, e, [(fix, fix)])
-                return
+            if pl in MODALS and lw.endswith("s") and len(lw) > 3:
+                base = None
+                for cand in (lw[:-1], lw[:-2] + "e" if lw.endswith("es") else None):
+                    if cand and (cand in IRREGULAR_S or cand in CORE_WORDS) \
+                            and (spell is None or spell.known([cand])):
+                        base = cand
+                        break
+                if base:
+                    fix = match_case(w, base)
+                    self._add("grammar", f"Use the base verb after “{pw}”: “{base}”",
+                              s, e, s, e, [(fix, fix)])
+                    return
             if (pl, lw) == ("your", "welcome"):
                 fix = match_case(pw, "you're")
                 self._add("grammar", "“your” → “you're”", ps, pe, ps, e, [(fix, fix)])
@@ -1906,7 +1929,13 @@ class Keys:
         self.m.reset(anchor=(x, y))
 
     def on_scroll(self, *a):
-        self.m.drop_rects()
+        m = self.m
+        with m.lock:
+            for i in m.issues:
+                i.rect = None
+            m.samples.clear()
+        m.sample_q.put(len(m.text))   # re-sample the caret so marks come back
+        m.notify()
 
 
 def watch_focus(model, stop):
@@ -1945,6 +1974,21 @@ class UI:
         self.card_rect = None
         self.lines = []
         self._dx = self._dy = 0
+        # anti-flicker / anti-jump state
+        self._last_sig = None          # signature of the last rendered card
+        self._render_at = 0.0          # when we last rebuilt the card
+        self._user_anchor = None       # pointer xy captured at card creation
+        self._pending = None           # latest snapshot queued for drawing
+        self._tip = tk.Toplevel(root)
+        self._tip.withdraw()
+        self._tip.overrideredirect(True)
+        self._tip.attributes("-topmost", True)
+        try:
+            self._tip.attributes("-alpha", 0.95)
+        except tk.TclError:
+            pass
+        tk.Label(self._tip, text="", bg="#0b0f1a", fg=FG, padx=8, pady=4,
+                 font=("Helvetica", 9), wraplength=260).pack()
         # Map each window once, off-screen, at startup so we can mark it non-activating
         # BEFORE it is ever shown over your document (so it can never steal focus).
         self.win.geometry("+-4000+-4000")
@@ -1969,11 +2013,32 @@ class UI:
         return w
 
     # ----- small widgets
-    def chip(self, parent, text, cmd, bg=PANEL, fg=FG):
+    def chip(self, parent, text, cmd, bg=PANEL, fg=FG, tip=None):
         lb = tk.Label(parent, text=text, bg=bg, fg=fg, padx=8, pady=3, cursor="hand2",
                       font=("Helvetica", 10, "bold"))
         lb.bind("<Button-1>", lambda e: cmd())
+        lb.bind("<Enter>", lambda e: self._tip_show(lb, tip or text))
+        lb.bind("<Leave>", lambda e: self._tip_hide())
         return lb
+
+    def _tip_show(self, widget, text):
+        if not text:
+            return
+        try:
+            self._tip.children["!label"].configure(text=text)
+            x = widget.winfo_rootx() + 4
+            y = widget.winfo_rooty() - 30
+            self._tip.geometry(f"+{x}+{max(y, 4)}")
+            self._tip.deiconify()
+            self._tip.lift()
+        except (tk.TclError, KeyError):
+            pass
+
+    def _tip_hide(self):
+        try:
+            self._tip.withdraw()
+        except tk.TclError:
+            pass
 
     def _drag_bind(self, *widgets):
         for w in widgets:
@@ -1993,13 +2058,15 @@ class UI:
         self.user_pos = None
         self.place()
 
-    # ----- placement (always fully on-screen)
+    # ----- placement (always fully on-screen, never jumps while typing)
     def place(self):
         self.win.update_idletasks()
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
         ms = get_monitors(self.root)
         if self.user_pos:
             ax, ay = self.user_pos[0] + w // 2, self.user_pos[1] + h // 2
+        elif self._user_anchor:
+            ax, ay = self._user_anchor          # fixed where the card first appeared
         else:
             anchor = self.snap and self.snap.get("anchor")
             ax, ay = anchor if anchor else self.root.winfo_pointerxy()
@@ -2013,11 +2080,16 @@ class UI:
         y = max(my + 4, min(y, my + mh - h - 4))
         if self.user_pos:
             self.user_pos = (x, y)
-        self.win.geometry(f"+{int(x)}+{int(y)}")
+        cur = (self.win.winfo_x(), self.win.winfo_y())
+        if (int(x), int(y)) != cur or not self.card_rect or \
+                self.card_rect[2:] != (w, h):
+            self.win.geometry(f"+{int(x)}+{int(y)}")   # only move when it changed
         self.card_rect = (int(x), int(y), int(w), int(h))
 
     def _show(self):
-        self.win.deiconify()
+        if self.win.state() == "withdrawn":
+            self._user_anchor = self.root.winfo_pointerxy()
+            self.win.deiconify()
         self.win.lift()
         self.place()
 
@@ -2028,6 +2100,19 @@ class UI:
 
     def render(self, snap):
         issues = snap["issues"]
+        # --- anti-flicker: only rebuild the card when its CONTENT changed.
+        sig = (tuple((i["id"], i["kind"], i["label"], i["hs"], i["he"]) for i in issues),
+               snap["selected"], self.collapsed, time.time() < self.toast_until)
+        if sig == self._last_sig and self.win.state() != "withdrawn":
+            self.snap = snap
+            self.draw_underlines()
+            return
+        # ...and never rebuild more than ~4x/second while typing fast
+        if time.time() - self._render_at < 0.25 and self.win.state() != "withdrawn":
+            self._pending = snap
+            self.draw_underlines()
+            return
+        self._last_sig, self._render_at, self._pending = sig, time.time(), None
         ms = get_monitors(self.root)
         # anchor: where the user is typing, so the card appears on that monitor
         pts = [i["rect"] for i in issues if i["rect"]]
@@ -2042,7 +2127,9 @@ class UI:
                          font=("Helvetica", 11, "bold")).pack()
                 self._show()
             else:
-                self.win.withdraw()
+                if self.win.state() != "withdrawn":
+                    self.win.withdraw()
+                self._user_anchor = None
                 self.card_rect = None
             self.draw_underlines()
             return
@@ -2056,7 +2143,14 @@ class UI:
         count = tk.Label(hdr, text=f"  {n} issue{'s' if n != 1 else ''}", bg=BG, fg=RED,
                          font=("Helvetica", 11, "bold"))
         count.pack(side="left")
-        self.chip(hdr, "+" if self.collapsed else "–", self.toggle_collapse).pack(side="right")
+        self.chip(hdr, "+" if self.collapsed else "–", self.toggle_collapse,
+                  tip="Collapse / expand the card (Ctrl+Alt+C)").pack(side="right")
+        quit_chip = self.chip(hdr, "⏸" if not snap["paused"] else "▶",
+                              self.model.toggle_pause,
+                              tip="Pause / resume checking (Ctrl+Alt+P)")
+        quit_chip.pack(side="right", padx=(0, 4))
+        if snap["paused"]:
+            tk.Label(hdr, text="paused", bg=BG, fg=MUTED, font=("Helvetica", 9)).pack(side="right")
         self._drag_bind(hdr, title, count)
         if toast_on:
             tk.Label(f, text=self.toast_text, bg=BG, fg=GREEN, font=("Helvetica", 10)).pack(anchor="w")
@@ -2105,21 +2199,29 @@ class UI:
         row.pack(anchor="w", pady=(0, 8))
         if sel["suggestions"]:
             for idx, (lab, _rep) in enumerate(sel["suggestions"][:3]):
+                conf = confidence(sel["word"].strip(), lab.split("→")[-1].strip()) \
+                    if sel["kind"] == "spelling" else 0.95
+                bar = "●" * max(1, round(conf * 5)) + "○" * (5 - max(1, round(conf * 5)))
                 self.chip(row, f"{idx + 1}  {lab}",
                           lambda idx=idx, iid=sel["id"]: self.model.apply(iid, idx),
-                          bg="#065f46").pack(side="left", padx=(0, 6))
+                          bg="#065f46",
+                          tip=f"Apply (Ctrl+Alt+{idx + 1})\nconfidence: {bar}").pack(side="left", padx=(0, 6))
         else:
             tk.Label(row, text="No suggestions", bg=BG, fg=MUTED, font=("Helvetica", 10)).pack()
 
         acts = tk.Frame(f, bg=BG)
         acts.pack(anchor="w")
-        self.chip(acts, "Ignore", self.model.ignore).pack(side="left", padx=(0, 6))
+        self.chip(acts, "Ignore", self.model.ignore,
+                  tip="Skip this issue (Ctrl+Alt+D)").pack(side="left", padx=(0, 6))
         if sel["kind"] == "spelling":
-            self.chip(acts, "Add to dictionary", self.model.add_word).pack(side="left", padx=(0, 6))
+            self.chip(acts, "Add to dictionary", self.model.add_word,
+                      tip="Never flag this word again (Ctrl+Alt+W)").pack(side="left", padx=(0, 6))
         if len(issues) > 1:
-            self.chip(acts, "Next", self.model.next_issue).pack(side="left", padx=(0, 6))
+            self.chip(acts, "Next", self.model.next_issue,
+                      tip="Jump to the next issue (Ctrl+Alt+N)").pack(side="left", padx=(0, 6))
             self.chip(acts, f"Fix all ({sum(1 for i in issues if i['suggestions'])})",
-                      self.model.fix_all, bg="#1e3a8a").pack(side="left")
+                      self.model.fix_all, bg="#1e3a8a",
+                      tip="Apply the top suggestion to every issue (Ctrl+Alt+F)").pack(side="left")
 
         others = [i for i in issues if i["id"] != sel["id"]][:MAX_CHIPS]
         if others:
@@ -2154,26 +2256,34 @@ class UI:
                 x += ox - i["origin"][0]
                 y += oy - i["origin"][1]
                 w = max(int(w), 6)                       # never a zero-width mark
+                y += 1                                   # sit just below the text baseline
                 if any(m[0] <= x < m[0] + m[2] and m[1] <= y < m[1] + m[3] for m in ms):
                     items.append((int(x), int(y), w, KIND_COLOR.get(i["kind"], RED),
                                   4 if i["id"] == sel else 3))
+        # deterministic order: top-to-bottom, left-to-right -> stable stacking
+        items.sort(key=lambda it: (it[1], it[0]))
         items = items[:len(self.lines)]
-        for idx, (w, (x, y, wd, color, th)) in enumerate(zip(self.lines, items)):
+        want = {idx: (x, y, wd, color, th)
+                for idx, (x, y, wd, color, th) in enumerate(items)}
+        for idx, w in enumerate(self.lines):
             try:
-                w.configure(bg=color)
-                # geometry BEFORE deiconify: many WMs refuse to map borderless
-                # windows that still have their old 1x1 size - this is why the
-                # underlines used to never show up.
-                w.geometry(f"{wd}x{th}+{x}+{y}")
-                if w.state() != "normal":
-                    w.deiconify()
-                w.lift(idx)                  # stable stacking -> no flicker
-            except tk.TclError:
-                pass
-        for w in self.lines[len(items):]:
-            try:
-                if w.state() == "normal":
-                    w.withdraw()
+                spec = want.get(idx)
+                if spec is None:
+                    if w.state() == "normal":
+                        w.withdraw()
+                    continue
+                x, y, wd, color, th = spec
+                cur = (w.winfo_x(), w.winfo_y(), w.winfo_width(), w.winfo_height())
+                if w.state() != "normal" or cur != (x, y, wd, th):
+                    w.configure(bg=color)
+                    # geometry BEFORE deiconify: many WMs refuse to map borderless
+                    # windows that still have their old 1x1 size - this is why the
+                    # underlines used to never show up. Re-setting identical geometry
+                    # every tick is what caused the flicker, so we skip it.
+                    w.geometry(f"{wd}x{th}+{x}+{y}")
+                    if w.state() != "normal":
+                        w.deiconify()
+                        w.lift(idx)                      # only on (re)map -> no flicker
             except tk.TclError:
                 pass
 
@@ -2181,7 +2291,12 @@ class UI:
         self.draw_underlines()
         if self.toast_until and time.time() > self.toast_until:
             self.toast_until = 0.0
+            self._last_sig = None          # force one rebuild to drop the toast line
             self.render(self.model.snapshot())
+        elif self._pending and time.time() - self._render_at >= 0.25:
+            snap, self._pending = self._pending, None
+            self._last_sig = None          # draw the update we skipped earlier
+            self.render(snap)
         self.root.after(250, self.tick)
 
 
@@ -2197,12 +2312,13 @@ def main():
         print("Done. They load automatically next time the assistant runs (or within seconds if it's running).")
         return
     make_dpi_aware()
+    init_spell_dictionary()            # merge the pre-packed dictionary now
     root = tk.Tk()
     root.withdraw()
     ui_q = queue.Queue()
     model = Assistant(lambda: ui_q.put(("refresh",)),
                       lambda text: ui_q.put(("toast", text)),
-                      CaretLocator())
+                      CaretLocator(root))
     ui = UI(root, model)
     keys = Keys(model, ui_q)
     keys.ui = ui
@@ -2238,7 +2354,7 @@ def main():
         root.after(60, poll)
 
     print(f"Dictionary folder: {DICT_DIR}  (drop word lists here; Ctrl+Alt+O opens it)")
-    print("Writing Assistant v2 running.\n"
+    print("Writing Assistant v4 running.\n"
           "  Ctrl+Alt+1/2/3 apply | N next | D ignore | W add word | F fix all | P pause | Q quit")
     root.after(60, poll)
     root.after(250, ui.tick)
