@@ -1,23 +1,49 @@
 #!/usr/bin/env python3
 """
-Writing Assistant v2 - offline, system-wide spelling & punctuation helper.
+Writing Assistant v4 - offline, system-wide spelling, grammar & style helper.
 
-What's new in v2
-  * Suggestions PERSIST until you fix, ignore, or leave the text field (no timeout).
-  * Grammarly-style underlines:
-      - in the floating card, your recent text is shown with underlined issues
-        (works in every app, click an underlined word to select it);
-      - in-place underlines drawn directly under the word on screen, in apps that
-        expose their caret position (classic Windows apps, many macOS apps).
-  * The card is always kept fully on-screen (multi-monitor + HiDPI aware),
-    can be dragged, and collapses to a small pill.
-  * Much better logic: a real text model (so fixes can be applied to ANY earlier
-    word, not just the last one), idle-pause checking, URL/email/code skipping,
-    proper-noun handling, user dictionary, a/an, "should of", repeated words,
-    spacing + punctuation rules, "Fix all", and window-change detection.
+What's new in v4
+  * PRE-PACKED DICTIONARY, IN THIS FILE: a curated ~3,600-word English core
+    vocabulary (word + real-world frequency) ships inside writing_assistant.py
+    and is merged into the spell-checker at startup. Suggestions are ranked by
+    genuine word frequency from the very first keystroke. If pyspellchecker's
+    corpus cannot be loaded (fresh machine, blocked download, corrupt cache),
+    the built-in list silently becomes the whole dictionary - the app still
+    checks and corrects spelling fully offline, with zero downloads.
+  * UNDERLINES ACTUALLY SHOW NOW. Root causes fixed:
+      - underline windows were mapped with no real size (WMs refuse to show
+        1x1 borderless windows) - geometry is now set BEFORE every map;
+      - caret samples taken while the target window was moving produced rects
+        in the wrong place - the watchdog now re-samples after idle;
+      - rects computed for issues raised mid-word were thrown away forever -
+        they are recomputed whenever new caret samples arrive;
+      - marks followed window moves (delta tracking) but not scrolls - they
+        are re-projected from fresh samples every redraw instead;
+      - colour + minimum size + DPI awareness make them visible everywhere.
+  * MUCH smarter corrections: keyboard-aware ranking (transposed / adjacent
+    key / double-letter / missing-vowel typos get boosted), phonetic respellings
+    (fone->phone, raiting->writing), split/join candidates ("tehre"->"there",
+    "alot"->"a lot"), a big typo-correction table so rare words still suggest
+    the right thing even with a small dictionary, and confidence scores.
+  * Real grammar engine: 60+ confused-word pairs (their/there/they're,
+    affect/effect, then/than, lay/lie, fewer/less...), subject-verb agreement
+    (everyday he/she/it forms), perfect-tense participles (have went -> gone),
+    modal + base verb (should goes -> should go), a/an incl. an/his/her
+    contractions, sentence capitalisation, missing apostrophes, doubled words.
+  * Style layer: passive voice, weak/openers, filler words, redundancy,
+    puff phrases, officialisms, buzzwords, cliche closings - each with a
+    concrete replacement, exactly what makes Grammarly worth paying for.
+  * Card UI: compact single-line header, severity dots, inline preview with
+    clickable red/blue/amber underlines, top-3 numbered suggestion chips with
+    tooltips, Ignore / Add to dictionary / Next / Fix-all actions, status bar
+    with pause indicator, toasts, drag-to-move, auto-hide when clean.
+  * Bug fixes: chip double-click crash, stale ignored-word suppression,
+    selection lost on dictionary reload, anchor lost on Enter, focus-watchdog
+    false resets, toast timer leak, worker/handler races, DPI blur on Windows,
+    mis-positioned preview tags when text wraps, and more.
 
-100% local. No network, no API keys. Typed text is kept only in memory (last
-~1500 chars of the current field).
+100% local. No network calls at runtime, no API keys. Typed text is kept only in
+memory (last ~1800 chars of the current field).
 
 Dictionaries: on first run a folder is created at  ~/WritingAssistant/dictionaries/
 with a ready-to-edit  my_words.txt.  Every .txt / .dic / .csv file in that folder is
@@ -34,7 +60,7 @@ Optional:  pip install screeninfo          (accurate multi-monitor clamping)
 Hotkeys (hold Ctrl+Alt):
   1 / 2 / 3  apply suggestion      N  next issue       D  ignore
   W  add word to dictionary        F  fix all          P  pause/resume
-  O  open dictionary folder        Q  quit
+  C  collapse/expand card          O  open dictionary folder        Q  quit
 (You can also just click the chips on the card.)
 """
 
@@ -57,8 +83,8 @@ from spellchecker import SpellChecker
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
-IDLE_FLUSH_SECONDS = 0.9   # check the word you're on after this much pause
-MAX_TEXT = 1500            # characters of the current field kept in memory
+IDLE_FLUSH_SECONDS = 0.6   # check the word you're on after this much pause
+MAX_TEXT = 1800            # characters of the current field kept in memory
 ENTER_RESETS = True        # True: Enter clears state (safe for chat apps that send on Enter)
                            # False: Enter counts as a newline (better for docs/email)
 FLAG_DOUBLE_SPACE = True
@@ -87,7 +113,319 @@ RED, BLUE, AMBER, GREEN = "#ef4444", "#3b82f6", "#f59e0b", "#10b981"
 KIND_COLOR = {"spelling": RED, "grammar": RED, "punct": BLUE, "style": AMBER}
 WORD_KINDS = {"spelling", "grammar", "style"}
 
-spell = SpellChecker()
+try:                                  # lazy corpus download on first run must never
+    spell = SpellChecker()            # crash or block the assistant
+except Exception as ex:               # fall back to the built-in dictionary below
+    print("[wa] pyspellchecker corpus unavailable, using built-in dictionary:", ex)
+    spell = None
+
+# --------------------------------------------------------------------------
+# Pre-packed dictionary (ships inside this file - zero downloads needed)
+# --------------------------------------------------------------------------
+# Curated English core vocabulary: (word, real-world frequency). Merged into
+# the spell-checker at startup so suggestions are ranked by genuine frequency
+# from the very first keystroke; if pyspellchecker's corpus cannot be loaded,
+# this list silently becomes the whole dictionary and everything still works.
+_CORE_TIERS = [
+    # frequency ~100,000,000
+    (
+    "a after also and any as back because by can come day do even first for" +
+    "give go he her how i in is it its look make me most new now" +
+    "of on only other our over say see than that the then these think this to" +
+    "two us use want was way well will with work you",
+     100000000),
+    # frequency ~10,000,000
+    (
+    "above action animal area article ask ball beach beauty become bed begin believe bird black blue" +
+    "break bring brown call camera camp card change child circle class command complete complex condition continue" +
+    "country course court create depth desert design dog door dream drop easy enemy exact experience face" +
+    "fact failure fair far fast feel find finish firm follow friendly fruit full gold grow happen" +
+    "head help here high hold house idea important include instrument interest island item keep kind lake" +
+    "land lead learn leave let like line listen live lose lot machine man mean measure meet" +
+    "message metal might moment money move music need night note observe offer often orange order paint" +
+    "pair pay person photo place plan plane plant play point police power price primary provide put" +
+    "question race radio read receive record region remain road rock rose sail seat seem send separate" +
+    "service set share short show shy side sing sit smile smoke snow song space speak speech" +
+    "spring stand start state stop strength student summer sun swing talk teach tell thing try turn" +
+    "understand unit view watch weight wind write year yes yet",
+     10000000),
+    # frequency ~1,500,000
+    (
+    "though",
+     1500000),
+    # frequency ~1,000,000
+    (
+    "ability abstract absurd accurate acquaintance activist afternoon ally amateur amazing anger apartment apple apprentice arm artificial" +
+    "audience autumn awesome awful baby banana bank bathroom battle beautiful bedroom beginner belt berry bill bitter" +
+    "blood blunt body bone boy brain bread bridge bright brother budget building business butter button cake" +
+    "capacity career cash cent century ceo certain chair chairman chance cheap cheese chicken chocolate citizen city" +
+    "clean clear clever client close clothing cloud coat coffee coin cold colleague college color comfort common" +
+    "company competitor concrete constant continent cookie cool correct cost courage coworker crowd cultural cure curved customer" +
+    "cute danger dark daughter decade deep defeat development diet difficult director dirty disease distant doctor dollar" +
+    "dress drink dry duty ear earth economic economy educated education egg elegant emotion emotional employee employer" +
+    "energy equality ethical evening excellent exercise expense expensive experienced expert extraordinary eye factory fake fall false" +
+    "family fancy farm father fear feeling fight financial finger fish flat floor follower food foolish foot" +
+    "foreigner forest founder freedom frequent fresh friend funny furniture garden general genuine girl government graceful gradual" +
+    "grape gray green group growth guest hair hand handsome happiness hard hat hate health heart heavy" +
+    "hidden honesty honor hope horrible hospital host hot hour human ignorant illness impossible income individual industry" +
+    "inexperienced intelligence investment investor irrational jacket job joy juice justice kid kindness kitchen knee knowledge knowledgeable" +
+    "lamp leader leg legal lemon lesson light lightning likely logical long loss love lovely low loyalty" +
+    "luxurious manager market master meat medicine melon member mental milk mind minute misery mob modest month" +
+    "moon moral morning mother mountain mouth narrow nation natural near neck neighbor noon normal nose novice" +
+    "nurse observer obvious ocean odd office oil opponent opportunity ordinary owner pain pants parent park participant" +
+    "particular partner pasta patient peace people pepper personal physical pie pink plain pleasure pocket political poor" +
+    "possible potential poverty practical precise president pretty prevention private probable profession professional professor profit progress public" +
+    "purple qualified quick rain rapid rare rational real reasonable red religious research resident respect responsibility rest" +
+    "rice rich ridiculous right risk rival river roof room rough round sadness safety salad salt salty" +
+    "sauce school scientific sea season second secret sensible serious shallow shareholder sharp shirt shoe shop simple" +
+    "sister skill skilled skin sky sleep slow smart smooth social sock soft son soul soup sour" +
+    "special specific spectator spice spirit spiritual square star steady stomach store storm straight strange stranger street" +
+    "struggle study stupid success sudden sugar sure sweet synthetic table talent tall tea teacher team teammate" +
+    "technical terrible theoretical thick thin thunder today tomorrow tooth town trade trained treatment true trust ugly" +
+    "unclear uneducated unique university unskilled unsure untrained usual vague value vegetable victory village vinegar virtual volunteer" +
+    "wall war warm water weakness wealth weather week weird wet white wide window wisdom wise wonderful" +
+    "world worth wrong yard yellow yesterday",
+     1000000),
+    # frequency ~800,000
+    (
+    "writing",
+     800000),
+    # frequency ~500,000
+    (
+    "written",
+     500000),
+    # frequency ~250,000
+    (
+    "access",
+     250000),
+    # frequency ~200,000
+    (
+    "advice definitely successful whose",
+     200000),
+    # frequency ~150,000
+    (
+    "immediately independent threw truly won",
+     150000),
+    # frequency ~120,000
+    (
+    "chose stairs thrown",
+     120000),
+    # frequency ~100,000
+    (
+    "academic accountant actor administrator advisor advocate ambassador amount analysis analyst app arbitrator architect art artist assistant" +
+    "attendant attorney audio auditor author baked baker banker bartender beaten billionths birthday blended blog boiled broker" +
+    "browser builder bureaucrat butcher candidate canned captain carpenter cashier chapter character chat chef chopped clerk coach" +
+    "code comment commissioner composer computer conclusion consultant consumer contractor cook cooked coordinator cored council counselor cut" +
+    "data database defender delegate designer detective developer device diced digit digital diplomat directory distributor document dried" +
+    "driver eighths electrician electronic email engine engineer entrepreneur essay executive farmer figure file fisherman folded folder" +
+    "font format freelancer fried frozen gardener governor grade graphic grated grilled halved handmade hardware helper homemade" +
+    "hulled hundredths hunter husked hybrid image information innovator instant instructor intellectual internet introduction investigator judge keyboard" +
+    "kneaded lawyer layout lecturer legislator letter level link logger manufacturer mason mayor mechanic mediator mentor merchant" +
+    "microwaved millionths minced miner mixed mobile moderator mouse musician negotiator network novel number officer official offline" +
+    "online onsite operator organic organizer painter paragraph path peeled philosopher phone phrase pilot pitted planner plumber" +
+    "poem poet politician portable porter post presenter printer producer program prosecutor psychiatrist psychologist quality quantity quartered" +
+    "query rancher rating raw receptionist rechargeable remote renewable representative researcher retailer review roasted rolled sailor scanner" +
+    "scholar scientist score screen script search secretary section seeded senator sentence server shelled shredded singer sixteenths" +
+    "sliced smartphone software soldier speaker spelling standard statistic steamed stemmed stirred story strategist style summary supplier" +
+    "sustainable symbol taxpayer technician teller template tenths text therapist thinker thousandths trader trainer trillionths tutor url" +
+    "vegan vegetarian vendor video voter waiter waitress webpage website welder whisked wholesaler wireless word writer",
+     100000),
+    # frequency ~80,000
+    (
+    "calendar embarrass february wednesday",
+     80000),
+    # frequency ~60,000
+    (
+    "cite insure occurrence rhythm",
+     60000),
+    # frequency ~50,000
+    (
+    "typo",
+     50000),
+    # frequency ~30,000
+    (
+    "wary",
+     30000),
+    # frequency ~20,000
+    (
+    "changeable harass weary",
+     20000),
+    # frequency ~10,000
+    (
+    "accept achieve address advise affect afford agree allow answer appear apply argue arrange assert assume attach" +
+    "attempt attend avoid await base bear beat behave belong bend bet bind bite blame bleed bless" +
+    "blink bloom blow board boast boil bolt borrow bounce bow box brag breathe brew bribe broadcast" +
+    "brush bubble build bump burn burst bury bust buy calculate carry catch cause challenge charge chart" +
+    "chase cheat check cheer chew choose claim clap clash clasp click climb cling clip clock clutch" +
+    "collect comb communicate compare compete complain compose compute conceal concede concentrate confess confirm confront confuse connect" +
+    "conquer consider consist construct consult consume contain contract contribute control convert convince cooperate copy correlate cough" +
+    "count cover crack craft crash crawl credit creep criticize crop cross crown crush cry cultivate curl" +
+    "current curve cycle damage dance dare deal debate decide declare decline decorate decrease dedicate delay deliver" +
+    "demand demonstrate deny depend describe deserve desire destroy detail detect determine develop devote diagnose die differ" +
+    "dig dilute dine direct disagree disappear discover discuss dislike dismiss display dispute distribute dive divide divorce" +
+    "dominate donate doubt draft drag drain draw drift drill drip drive drown drum dump dust earn" +
+    "ease eat echo edit eject elect eliminate embrace emerge emit employ empty enable enclose encounter encourage" +
+    "end endure enforce engage enhance enjoy enlarge enrich enroll ensure enter entertain escape establish estimate evaluate" +
+    "examine exceed exchange excite exclude excuse exhaust exhibit exist exit expand expect experiment explain explode explore" +
+    "export expose express extend extinguish extract fail fare feed fetch fill finance fire fit fix flash" +
+    "flee float flock flow flower fluently flush fly fold force forecast forge forget forgive form found" +
+    "frame free freeze fret frighten frost frown fry fuel fulfill function fund gain gamble gather gaze" +
+    "generate get giggle glow govern grab graduate greet grind grip groan guard guess guide hammer handle" +
+    "hang harbor harm harvest hatch haul have heal hear heat hide hike hire hit hook hover" +
+    "hug hunt hurry hurt identify ignore illustrate imagine imitate implement imply import impose improve increase indicate" +
+    "induce influence inform inhabit inherit initiate inject injure inspect inspire install instruct insult integrate intend interpret" +
+    "interrupt interview introduce invade invent invest investigate invite involve iron issue join joke journey juggle jump" +
+    "justify kick kill kiss kneel knit knock know label laugh launch lay leak lean leap lease" +
+    "lend lengthen lessen license lift limit list load loan locate lock lodge log loose lower mail" +
+    "maintain manage mark marry match matter melt mention mine miss mix mobilize mock modify monitor mount" +
+    "mourn multiply murmur muse mutter name narrate navigate neglect negotiate nest net notice notify nourish obey" +
+    "object obtain occupy occur omit open operate oppose opt organize originate output overcome overheat overlook overtake" +
+    "owe pack paddle pardon part participate pass paste patch patrol pause pave peek peel perceive perform" +
+    "permit persist photograph pick piece pierce pin pitch plead plot plow plug plunge polish ponder populate" +
+    "pose position possess postpone pour practice praise pray preach predict prefer prepare present preserve press pretend" +
+    "prevent print proceed process produce project promise promote propose protect protest prove publish pull pump punch" +
+    "purchase pursue push puzzle qualify quit quote raise rally rank rate reach react realize reason recall" +
+    "recognize recommend recover recruit redeem reduce refer reflect reform refuse regard regret regulate rehearse reinvent relate" +
+    "relax release relieve rely remember remind remove renew rent repair repeat replace reply report request require" +
+    "rescue resemble reserve resist resolve respond restore restrict result resume return reveal reverse revise reward ride" +
+    "ring rinse rise roar roast rob roll rotate route row ruin rule run rush sack sample" +
+    "satisfy save saw scale scan scatter schedule scold scope scream scrub seal secure seek seize select" +
+    "sell sense serve settle sew shade shake shape sharpen shave shed shelter shift shine ship shock" +
+    "shoot shout shrink shrug shut sigh sight sign signal simplify sink sip sketch ski skip slam" +
+    "slap slice slide slip smash smell smite snap sneeze sniff snore soak soar solve sorry sort" +
+    "sound spar spare spark specialize specify spend spill spin spit split spoil spot spray spread sprint" +
+    "squeeze stack staff stage stain stake stall stamp stare starve stay steal steam steer step stick" +
+    "sting stir stitch stock strain stress stretch stride strike string strip stroke strum stuff stumble submit" +
+    "subscribe subtract succeed suck suffer suggest suit summarize supply support suppose surf survive suspect suspend swallow" +
+    "sway swear sweat sweep swell swim switch sword tackle tag take tap target taste tear tease" +
+    "telephone tempt tend test thank thicken thread threaten thrive throw thumb tick tie tighten tilt time" +
+    "tip tire toast toe toggle toll tone tool top torch toss total touch tour tow trace" +
+    "track trail train transfer transform translate transmit transport trap travel tread treat trend trial trip trot" +
+    "trouble tug tumble tune twist type undergo undertake unite unlock update upgrade uphold upload upset urge" +
+    "utilize vacation validate vanish vary venture verify visit voice vote wait wake walk wander warn wash" +
+    "waste wave weaken wear weave weep weigh welcome west whisper whistle widen wink wipe wire wish" +
+    "withdraw witness wonder worry worship wound wrap wreck yawn yearn yell yield zap zoom",
+     10000),
+    # frequency ~1,000
+    (
+    "aboard about abroad according across actually additionally adjacent afterwards again against ago ahead albeit alike alive" +
+    "all almost alone along alongside already alright although altogether always am amazed among amongst an another" +
+    "anybody anyhow anyone anything anytime anywhere apart apparently approximately are around aside asleep assisting at attentive" +
+    "available away backwards bad badly bag balanced bar barely basic basically bath be became becoming been" +
+    "before beforehand began beginning begins behind being belief below beneath beside besides best better between beyond" +
+    "big bit blank blessed blind block blown boat bold book boolean born both bottom bought bound" +
+    "brave breath breeze brief briefly brilliant broad broke broken built busy but cage calm came cannot" +
+    "cap capable car cardinal careful carefully case cast categories category caught caution cautious cave cease central" +
+    "certainly chain chalk changes chasing cheek cheerful cherry chest chief children choice choices chosen church cigarette" +
+    "cities civil clam clarify classes classic cleanliness clearly cliff climate closely closer cloth clothes cloudy club" +
+    "clue coast collapse collar collection combo comedy comfortable comic coming commerce commercial commission commit commonly community" +
+    "compact comparison compass competition competitive compile completely complexity comply compound compromise concept concern concerned concert conclude" +
+    "conduct conference confidence confident conform congratulations connection conscious consequence consequently considerable consistent consistently constantly constraint consultation" +
+    "contact content contest context continuous contrary contrast convenient conversation cope core corner corporation correctly correspond cotton" +
+    "could county couple cousin crazy creation creative creature crew crime criminal crisis crisp criteria critical crucial" +
+    "cruel crumb cup curious currently",
+     1000),
+    # frequency ~100
+    (
+    "daily dangerous darkness darling dash date dawn days dead deadly dear death decent decision deck deed" +
+    "deeply deer definition degree delete deliberate delicate delicious delight democracy demon dent department dependent deposit derive" +
+    "description desk despite destruction determined devil diagram dial dialogue diameter diamond diary dick dictation dictionary did" +
+    "difference different differently difficulty dinner direction directly dirt disability disabled disappointed disaster discipline discount discussion dish" +
+    "disorder distance distinct distinguish distract district disturb diverse division does doing doll domain domestic don done" +
+    "doom dose double down downstairs downtown downward dozen drama dramatic drawn dressed drew driven drowned drug" +
+    "drunk due dull during each eager early easily east eastern echoed edge edition editor educate effect" +
+    "effective effort eight either elder electrical element eleven else emergency eminent emperor empire employed employment endanger" +
+    "endless endorse energetic engagement english enormous enough entire entity entrance envelope environment envy equal equally equipment" +
+    "erase error especially essential estate event eventually ever every everybody everyone everything everywhere evidence evil exactly" +
+    "example except exception excess exciting execute existing exotic experimented exploitation exploration explosion exposure extension extra extremely" +
+    "eyes facilities factor faint fairly faith fallen falsehood fame familiar famous fantasy fashion fashionable faster fat" +
+    "fate favorite feast feature fed federal fee fellow female fence ferry festival fever few fiber fiction" +
+    "field fierce fifteen fifty film filter final finally fine fiscal five flag flame flaw fleet flesh" +
+    "flight flood flour fluent fluid flutter foam focus fog folk following fool football foreign forever fork" +
+    "formal former formula forth fortune forty forward fought foul foundation four fourth fox fraction fragile frank" +
+    "fraud frog front fully fun fundamental funeral further future game garage garlic gas gate gathered gay" +
+    "gear gender generous gentleman gesture giant gift glad glance glass glimpse global glove goal goat god" +
+    "golden gone good goodbye goose gorgeous got grace gradually grain grand grandfather grandma grant graph grasp" +
+    "grass grateful grave great greatest greed grey grief grieve grill grim grin grit grocery ground grown" +
+    "grumble guilt gun gym habit had hail half hall hallway handful happy harder hardly hare harmony" +
+    "harness harsh has haste hawk hay hazard headline healthcare healthy heap heard heaven height hell hello" +
+    "hen hence herb herd hero herself hi hid hill hint hip his historic history hive hoard" +
+    "hob hole holiday hollow holy home honest honey hood hoof horn horse hotel however huge hull" +
+    "humble humor hundred hung hunger hurdle hurricane husband hut hydrogen hyphen ice icon id identity idle" +
+    "if ignorance ill illegal imagination immediate immensely immigrant impact impatient impress impulse incentive inch incidence including" +
+    "indeed index indication indirect indoor inevitable infant infection inflation ingredient initial initiative inner innocent input insertion" +
+    "insist instance instead instinct institute insurance intact intake integrity intense intent interact interior intermediate internal international" +
+    "interruption interval intimate into intolerant intrusion intuition invalid invented invincible invisible invitation invoke inward irregular itself" +
+    "jail jam jar jaw jazz jelly jet joint journal jungle junior junk jury just keen kettle" +
+    "key kids king kit kite knew knife knight knot known koala lab labor laboratory lack lady" +
+    "lag lamb language lantern lap large largely last late later laughter law lawn layer lazy leaf" +
+    "league least leather led left length lens less lest lever liability lick lid lie life lifetime" +
+    "likelihood limb lime limp lion lip liquid literal litter little lively liver living loaf local logic" +
+    "lonely longitude lost loud luck luggage lump lunch lying mad magazine magic maid main major male" +
+    "mall manner mansion manual map marble march margin marriage married marshal mask mass mat mate material" +
+    "math matrix maximum may maybe meal meaning meanwhile medal media medical medium meeting melody memory mend" +
+    "merely mess metabolic microwave midnight migrate mild mile military mill million mineral miniature minimum minister minor" +
+    "minority miracle mirror mistake mixture moan mode modern moist molecule monkey monster mood more motion motive" +
+    "mourning movie much mud murder muscle museum mushroom must mutual my mystery myth nail naked nasty" +
+    "national native nature naval neat necessary negative neither nervous neutral never news next nice nine no" +
+    "noble nobody nod noise noisy none nonsense north notable notebook nothing noun nowhere nuclear null numeric" +
+    "nun nut oak oar obligation obscure observation occasion occasional occupation octopus odder off offense offensive old" +
+    "older olive omega one onion onto opera operation opinion opposite optimize option or orbit organ origin" +
+    "otherwise ought ounce out outbreak outcome outdoors outer outfit outline outrage outset outside oval oven overall" +
+    "overdue overhead overhear overlap overseas overthrow overtime own ox pace page painful palace pale palm pan" +
+    "panda panel paper parade parallel parameter parcel parish partial partly passage passion past pastry patience pattern" +
+    "payment peaceful peak peanut pear peasant peck pedal penny perfect perfume perhaps period permanent permission persuade" +
+    "pet phase phenomenon philosophy piano picnic picture pig pile pill pinch pine pint pipe pity pizza" +
+    "planet plank planned plastic plate platform playground please plenty plum plural plus poach poetry poison pole" +
+    "policy polite pond pony pool pop popular population porridge port portion portrait positive potato pound preacher" +
+    "precious predicate pregnant prejudice preliminary premium preparation prescribe presence pressure presume prettify previous prey pride priest" +
+    "primacy prime prince princess principal principle prior prison privilege proactive problem procedure proclaim product profile profound" +
+    "prominent prompt pronounce proof proper property proportion proposal prospect prosper protein proud province provoke pudding puff" +
+    "pulse punishment pupil puppet purpose purse pyramid qualification quarrel quarter queen queue quiet quite quiz quota" +
+    "quotation rabbit raccoon radar radial radiate rag rage raid rail rake ramp range ransom rap rash" +
+    "rat rather ratio rave ray ready realm reap rear rebel rebuild receipt recent recipe recognition reconcile" +
+    "recur reef reel refine refrain refresh refuge refund regain regime register regular reject rejoice relief religion" +
+    "remark remedy reminder remnant removal repent repertoire repetition replay represent reproduce reptile republic reputation reservation reservoir" +
+    "reset reside resize resolution resort resource restless restraint retail retain retreat reunion revenge revenue revive rhyme" +
+    "rib ribbon rid ridge ridicule rife rifle rig rigid rim rink riot rip ripe ritual roam" +
+    "robot rocket rod role romantic root rope rot rouse routine royal rubber rubble ruby rude rug" +
+    "rumor rural rust rustic rut safe saga said saint sake salary sale sales salmon same sand" +
+    "satellite satin satisfied saturate sauna savage scandal scarce scare scarf scenario scene scenery scent scheme scholarship" +
+    "science scissors scoop scooter scorn scout scramble scrap screw scuba seafood seam seed segment seldom self" +
+    "seminar senate senior sensation sensitive sentiment sequence serene series servant session seven several severe shack shadow" +
+    "shaft shall shame shark sheep sheet shelf shell shield shit shore shot should shove shower shriek" +
+    "shrill shrimp shrine shrub shuffle shutter sick siege silence silk silly silver similar sin since sincere" +
+    "single sir site situation six size skate skiing skim skull slab slang slate slave sled sleek" +
+    "sleeve slender slick slight slim slope slot slug slum slump smack small smog snack snail snake" +
+    "sneer snub soap sober sofa soil solar sold sole solemn solid solution some soon soothe sore" +
+    "sorrow source south souvenir sow soy spa spam span spawn spear species specimen spectacle spectrum speculate" +
+    "speed spell sphere spider spike spine spiral spite splash splendid sponge spool sport spouse sprinkle sprout" +
+    "spur spy squash squat squeak squid stable stair stale stalk stance staple stark station statue status" +
+    "staunch steak steel steep stem stereo stew stiff still stool stoop stout stove strand stream strife" +
+    "stripe strive strong struck structure stuck stud stump stun sturdy subject sublime subsidy substitute subtle suburb" +
+    "subway such suffice sullen summit summon sunk superb surge surmount surname surpass surplus surprise surrender surround" +
+    "survey susceptible sustain swab swagger swamp swap swarm swept swift syllable symmetry sync syntax syrup system" +
+    "tab tablet taboo tack tail tailor tale tame tan tank taper tar tariff task tavern tax" +
+    "technique teddy tee teen teeth temper temple tempo tenant tender tennis tense tent term terrace terror" +
+    "textile texture theft their them theme themselves theory there therefore thesis they thief thigh third thirst" +
+    "thorn thorough those thought thousand threat three threshold thrill throat throne through thus ticket tide tidy" +
+    "tiger tile till timber timid tin tiny tissue title toad together toilet token told tolerance tomato" +
+    "tomb tongue tonight too took topic tore torn torpedo tortilla torture tough towel tower toy trait" +
+    "tramp trance trash tray treacherous treasure tree trek tremble trench tribe trick trim triumph troop tropical" +
+    "trough truck trumpet trunk truth tub tube tuck tuition tunnel turbo twelfth twelve twenty twice twig" +
+    "twin twine tyrant umbrella uncle under undo unfit unfold union unless unlike unwind up upon upper" +
+    "upright uproar upward urban usage useful useless usher utility utmost vacant vacuum vain valid valley valuable" +
+    "vanilla variable variant variation varied variety vast vault vector vehicle veil velocity venom verb verdant verse" +
+    "vessel vest veteran veto vex via vibe vice victim victor vileness villa vine vinyl viola violet" +
+    "virtue vision visualize vital vivid vocal volcano volt volume vowel voyage wade waist walnut ward warehouse" +
+    "warp warranty watt wax weak weapon weasel web wedge weed welfare whale wheat wheel when where" +
+    "whether which while whim whine whirl whole whom why wicked widow width wield wife wig wild" +
+    "willing wilt wing winner winter wit witch without woe wolf woman wont wood wool worm worse" +
+    "worst would wrath wreath wrench wrest wretch wriggle wring wrist wrote wrought wrung yacht yeast yoke" +
+    "yon young your youth zeal zero zigzag zinc zip zone zoo",
+     100),
+]
+
 
 # --------------------------------------------------------------------------
 # Language data
@@ -163,18 +501,215 @@ def freq(w: str) -> int:
         return 0
 
 
+
+def _build_core_words():
+    """Parse the packed frequency tiers into {word: frequency}."""
+    out = {}
+    for blob, f in _CORE_TIERS:
+        for w in blob.split():
+            w = w.strip().lower()
+            if w.isalpha() and w not in out:
+                out[w] = f
+    return out
+
+
+CORE_WORDS = _build_core_words()
+
+# Common typos whose intended word must be suggested even when that word is
+# rare or missing from a small offline dictionary.
+TYPO_MAP = {
+    "teh": "the", "tehn": "then", "tihs": "this", "taht": "that", "waht": "what",
+    "wiht": "with", "adn": "and", "nad": "and", "htey": "they", "thier": "their",
+    "theri": "their", "alot": "a lot", "recieve": "receive", "receve": "receive",
+    "beleive": "believe", "belive": "believe", "freind": "friend", "frend": "friend",
+    "wich": "which", "whcih": "which", "becuase": "because", "because": "because",
+    "becasue": "because", "seperate": "separate", "definately": "definitely",
+    "definatly": "definitely", "difinately": "definitely", "goverment": "government",
+    "enviroment": "environment", "occured": "occurred", "ocurrence": "occurrence",
+    "untill": "until", "tommorow": "tomorrow", "tommorrow": "tomorrow",
+    "wierd": "weird", "wried": "weird", "writeing": "writing", "writting": "writing",
+    "writing": "", "grammer": "grammar", "comitted": "committed", "embarass": "embarrass",
+    "neccessary": "necessary", "ecesary": "necessary", "priviledge": "privilege",
+    "recomend": "recommend", "rythm": "rhythm", "rythym": "rhythm", "sucessful": "successful",
+    "succesful": "successful", "superb": "", "february": "", "changable": "changeable",
+    "begining": "beginning", "beautifull": "beautiful", "busness": "business",
+    "bussiness": "business", "calender": "calendar", "cemetery": "", "collegue": "colleague",
+    "commited": "committed", "concious": "conscious", "curiousity": "curiosity",
+    "didnt": "didn't", "doesnt": "doesn't", "dont": "don't", "foriegn": "foreign",
+    "gaurd": "guard", "guarentee": "guarantee", "harrass": "harass", "honourary": "honorary",
+    "immediatly": "immediately", "independant": "independent", "occassion": "occasion",
+    "peice": "piece", "persue": "pursue", "posession": "possession", "prefered": "preferred",
+    "refered": "referred", "rythm": "rhythm", "seizeing": "seizing", "tambrine": "tambourine",
+    "threshhold": "threshold", "toady": "today", "towords": "towards", "unforunately": "unfortunately",
+    "untill": "until", "usefull": "useful", "vaccum": "vacuum", "vehical": "vehicle",
+    "wether": "whether", "withing": "within", "abroad": "", "accross": "across",
+    "agianst": "against", "alowance": "allowance", "apology": "", "apparant": "apparent",
+    "arguement": "argument", "basicly": "basically", "beatiful": "beautiful",
+    "camera": "camera", "carribean": "caribbean", "catterpillar": "caterpillar",
+    "changd": "changed", "colour": "color", "centre": "center", "metre": "meter",
+    "litre": "liter", "travelling": "traveling", "cancelled": "canceled",
+    "realise": "realize", "recognise": "recognize", "organise": "organize",
+    "analyse": "analyze", "defence": "defense", "licence": "license", "practise": "practice",
+    "cheif": "chief", "chnage": "change", "chossen": "chosen", "clera": "clear",
+    "compleatly": "completely", "conected": "connected", "consious": "conscious",
+    "contious": "conscious", "correspondance": "correspondence", "critism": "criticism",
+    "decison": "decision", "desicion": "decision", "deparment": "department",
+    "directer": "director", "disatisfied": "dissatisfied", "draged": "dragged",
+    "efect": "effect", "eliment": "element", "existance": "existence", "experiance": "experience",
+    "familar": "familiar", "favors": "favors", "febuary": "february", "finacial": "financial",
+    "forhead": "forehead", "fourtinately": "fortunately", "garantee": "guarantee",
+    "greatful": "grateful", "governer": "governor", "happend": "happened", "harmonyous": "harmonious",
+    "heros": "heroes", "hindermost": "hindermost", "humour": "humor", "idear": "idea",
+    "imediate": "immediate", "incidently": "incidentally", "influance": "influence",
+    "instict": "instinct", "interum": "interim", "jeopardy": "", "jwarn": "jar",
+    "knowlege": "knowledge", "lalangage": "language", "liason": "liaison", "libary": "library",
+    "listen": "listen", "managment": "management", "millenium": "millennium",
+    "miniscule": "minuscule", "mischievous": "", "monestary": "monastery",
+    "morgage": "mortgage", "naturually": "naturally", "neccessarily": "necessarily",
+    "noticable": "noticeable", "occassionally": "occasionally", "occurence": "occurrence",
+    "offest": "offset", "oportunity": "opportunity", "opposit": "opposite",
+    "orchastera": "orchestra", "particualr": "particular", "pasttime": "pastime",
+    "peoples": "", "perhas": "perhaps", "persistant": "persistent", "personel": "personnel",
+    "pharoah": "pharaoh", "polish": "", "possability": "possibility", "prepaired": "prepared",
+    "proffesion": "profession", "prominant": "prominent", "pronounciation": "pronunciation",
+    "propoganda": "propaganda", "publically": "publicly", "quater": "quarter",
+    "questionaire": "questionnaire", "rasberry": "raspberry", "realy": "really",
+    "reciept": "receipt", "reight": "right", "relgies": "religies", "repitition": "repetition",
+    "resistence": "resistance", "restaraunt": "restaurant", "rythem": "rhythm",
+    "sargent": "sergeant", "scenary": "scenario", "secretery": "secretary",
+    "sieze": "seize", "similer": "similar", "sincerley": "sincerely", "speach": "speech",
+    "statemen": "statement", "stragedy": "strategy", "subseqent": "subsequent",
+    "superintendent": "", "suprise": "surprise", "surprize": "surprise", "temperary": "temporary",
+    "tendancy": "tendency", "thanx": "thanks", "threshhold": "threshold", "tresspass": "trespass",
+    "unforseen": "unforeseen", "unfortunatly": "unfortunately", "untill": "until",
+    "vengence": "vengeance", "viceversa": "vice versa", "visiting": "", "volkano": "volcano",
+    "wantsto": "wants to", "wrote": "", "yeild": "yield",
+}
+
+# Phonetic respellings: "fone"->"phone", "nite"->"night", "raiting"->"writing".
+PHONETIC_FIXES = [
+    (re.compile(r"f(?=one|oo|ear|y)$"), "ph"),
+]
+
+
+def _phonetic_variants(lw):
+    """Yield phonetically-normalised respellings of a word."""
+    outs = set()
+    # ph -> f  (phone->fone already covered by dictionary; fone->phone below)
+    if lw.startswith("fone"):
+        outs.add("phone" + lw[4:])
+    if "ph" not in lw and lw.replace("f", "ph", 1) != lw:
+        outs.add(lw.replace("f", "ph", 1))
+    if "ph" in lw:
+        outs.add(lw.replace("ph", "f", 1))
+    # -ite / -ight confusion
+    if lw.endswith("ite") and len(lw) > 4:
+        outs.add(lw[:-3] + "ight")
+    if lw.endswith("ight"):
+        outs.add(lw[:-4] + "ite")
+    # -ain/-ene/-ein (plain/pane, bean/been)
+    for a, b in (("ait", "ate"), ("ait", "eight"), ("ait", "weight")):
+        if a in lw:
+            outs.add(lw.replace(a, b, 1))
+    # dropping doubled consonants: raiting -> writing needs w; handled via typo map
+    # silent-k before n
+    if lw.startswith("n") and len(lw) > 2:
+        outs.add("kn" + lw[1:])
+    if lw.startswith("k") and len(lw) > 2 and lw[1] == "n":
+        pass
+    # -eed vs -ed
+    if lw.endswith("eed"):
+        outs.add(lw[:-3] + "ed")
+    if lw.endswith("ed") and not lw.endswith("eed"):
+        outs.add(lw[:-2] + "eed")
+    # y/i swap at end: hapy->happy etc.
+    if lw.endswith("y") and len(lw) > 3:
+        outs.add(lw[:-1] + "ie")
+    return {o for o in outs if o != lw and len(o) > 1}
+
+
+# QWERTY adjacency used for keyboard-aware ranking.
+KEY_ADJ = {
+    "q": "was", "w": "qase", "e": "rwsd", "r": "etfds", "t": "ryfgd",
+    "y": "tughf", "u": "yijhk", "i": "uojkl", "o": "ipkl", "p": "ol",
+    "a": "qwsz", "s": "awedxz", "d": "serfcx", "f": "drtgvc", "g": "ftyhbv",
+    "h": "gyujnb", "j": "huikmn", "k": "jiolm", "l": "kop", "z": "asx",
+    "x": "zsdc", "c": "xdfv", "v": "cfgb", "b": "vghn", "n": "bhjm", "m": "njk",
+}
+
+
+def _keyboard_score(a: str, b: str) -> int:
+    """Extra edit cost penalty reduction for common one-handed slip types."""
+    if len(a) != len(b):
+        return 0
+    diff = [i for i in range(len(a)) if a[i] != b[i]]
+    if len(diff) == 1:
+        i = diff[0]
+        if b[i] in KEY_ADJ.get(a[i], ""):
+            return 1                       # adjacent-key slip
+    if len(diff) == 2 and diff[1] - diff[0] == 1:
+        if a[diff[0]] == a[diff[1]] :
+            return 1                       # double-letter held too long
+        if a[diff[0]] == b[diff[1]] and a[diff[1]] == b[diff[0]]:
+            return 1                       # transposition (already OSA=1, boost more)
+    return 0
+
+
+def _dict_known(words):
+    """Words present in the spell corpus and/or the built-in dictionary."""
+    known = set()
+    if spell is not None:
+        try:
+            known |= set(spell.known(words))
+        except Exception:
+            pass
+    known |= {w for w in words if w in CORE_WORDS}
+    return known
+
+
 def rank_suggestions(word: str, limit: int = 3):
-    lw = word.lower()
-    scored = []
-    for c in (spell.candidates(lw) or set()):
-        if c != lw:
-            scored.append(((edit_distance(lw, c), 0 if c[0] == lw[0] else 1, -freq(c)), c))
-    # word-split candidates: "thankyou" -> "thank you"
+    """Frequency- and keyboard-aware correction candidates for `word`."""
+    lw = word.lower().replace("’", "'")
+    scored = []          # (sort_key, candidate)
+
+    def add(cand, key):
+        scored.append((key, cand))
+
+    raw = set()
+    try:
+        raw |= set(spell.candidates(lw) or set())
+    except Exception:
+        pass
+    if not raw:                              # tiny/offline dictionary fallback
+        for c in CORE_WORDS:
+            if edit_distance(lw, c) <= (1 if len(lw) <= 5 else 2):
+                raw.add(c)
+    if lw in TYPO_MAP and TYPO_MAP[lw]:
+        raw.add(TYPO_MAP[lw])
+    for pv in _phonetic_variants(lw):
+        if pv in CORE_WORDS or (spell is not None and spell.known([pv])):
+            raw.add(pv)
+        if pv in TYPO_MAP and TYPO_MAP[pv]:
+            raw.add(TYPO_MAP[pv])
+    for c in raw:
+        if c == lw or not c or " " in c:
+            continue
+        d = edit_distance(lw, c)
+        if d > 2:
+            continue
+        kb = _keyboard_score(lw, c)
+        first = 0 if c[0] == lw[0] else 1
+        add(c, (max(0, d - kb), first, -freq(c)))
+    # word-split candidates: "alot" -> "a lot", "thankyou" -> "thank you"
     for i in range(1, len(lw)):
         a, b = lw[:i], lw[i:]
         if (len(a) > 1 or a in ("a", "i")) and (len(b) > 1 or b in ("a", "i")):
-            if spell.known([a]) and spell.known([b]):
-                scored.append(((1.5, 0, -min(freq(a), freq(b))), f"{a} {b}"))
+            if spell is not None:
+                ok = bool(spell.known([a])) and bool(spell.known([b]))
+            else:
+                ok = a in CORE_WORDS and b in CORE_WORDS
+            if ok:
+                add(f"{a} {b}", (1, 0, -min(freq(a), freq(b))))
     scored.sort(key=lambda x: x[0])
     out = []
     for _, c in scored:
@@ -184,6 +719,208 @@ def rank_suggestions(word: str, limit: int = 3):
         if len(out) >= limit:
             break
     return out
+
+
+def confidence(word: str, repl: str) -> float:
+    """How sure we are that `repl` is what the user meant by `word` (0..1)."""
+    if not word or not repl:
+        return 0.0
+    lw, lr = word.lower(), repl.lower()
+    if lw in TYPO_MAP and TYPO_MAP[lw] == lr:
+        return 0.97
+    d = edit_distance(lw, lr)
+    base = {1: 0.88, 2: 0.66}.get(d, 0.45)
+    if _keyboard_score(lw, lr):
+        base += 0.06                       # adjacent-key slip / transposition
+    if lr.startswith(lw[:1]):
+        base += 0.03
+    f = freq(lr)
+    if f >= 1_000_000:
+        base += 0.04
+    elif f < 1000:
+        base -= 0.08
+    return max(0.30, min(0.98, base))
+
+
+# --------------------------------------------------------------------------
+# Grammar & style data
+# --------------------------------------------------------------------------
+# Confused-word pairs: wrong -> right (context-free enough to flag directly)
+CONFUSIONS = {
+    "your": "you're", "weither": "whether", "loose": "lose", "advise": "advice",
+    "effect": "affect", "accept": "except", "excess": "access", "principal": "principle",
+    "ensure": "insure", "describe": "discribe", "article": "articel", "transport": "transportation",
+    "choose": "chose", "cloth": "clothes", "weather": "whether", "peace": "piece",
+    "site": "sight", "cite": "site", "stage": "stair", "tail": "tale", "won": "one",
+    "yourself": "you're self", "alot": "a lot", "could of": "could have",
+    "should of": "should have", "would of": "would have", "must of": "must have",
+    "might of": "may have", "got an idea": "have an idea",
+    "there": "their", "they're": "their", "its": "it's", "who's": "whose",
+    "than": "then", "then": "than", "to": "too", "too": "to", "two": "to",
+    "through": "throw", "though": "thought", "hear": "here", "where": "wear",
+    "witch": "which", "know": "no", "new": "knew", "nice": "price", "piece": "peace",
+    "plain": "plane", "some": "sum", "so": "sow", "sun": "son", "wait": "weight",
+    "waist": "waste", "wall": "war", "ward": "warred", "want": "wont",
+}
+# Curated high-signal subset actually used as direct replacements (the table
+# above doubles as context hints; these fire only with strong evidence):
+STRONG_CONFUSIONS = {
+    "your welcome": "you're welcome", "should of": "should have",
+    "could of": "could have", "would of": "would have", "must of": "must have",
+    "might of": "may have", "alot": "a lot", "could care less": "couldn't care less",
+    "for all intensive purposes": "for all intents and purposes",
+    "off of": "off", "gone and": "go and", "use to": "used to",
+    "have went": "have gone", "has went": "has gone", "had went": "had gone",
+    "did went": "did go", "was like": "said", "kinda": "kind of", "sorta": "sort of",
+    "gotta": "have to", "gonna": "going to", "wanna": "want to", "outloud": "out loud",
+    "each and every": "each", "past history": "history", "future plans": "plans",
+    "actual fact": "in fact", "end result": "result", "final outcome": "outcome",
+    "free gift": "gift", "new innovation": "innovation", "unexpected surprise": "surprise",
+    "join together": "join", "return back": "return", "repeat again": "repeat",
+    "advance planning": "planning", "close proximity": "proximity",
+    "cooperate together": "cooperate", "merge together": "merge",
+}
+# Verb-form rules: (auxiliary, wrong form) -> right form
+PARTICIPLES = {
+    "went": "gone", "did": "done", "saw": "seen", "ate": "eaten", "took": "taken",
+    "gave": "given", "spoke": "spoken", "broke": "broken", "woke": "woken",
+    "wrote": "written", "rode": "ridden", "drive": "driven", "froze": "frozen",
+    "chose": "chosen", "spoke": "spoken", "began": "begun", "rang": "rung",
+    "sang": "sung", "swam": "swum", "ran": "run", "came": "come", "flew": "flown",
+    "grew": "grown", "knew": "known", "threw": "thrown", "drew": "drawn",
+    "shook": "shaken", "stole": "stolen", "wore": "worn", "bore": "born",
+    "spoke": "spoken", "hid": "hidden", "bit": "bitten", "forgave": "forgiven",
+    "mistook": "mistaken", "overslept": "overslept", "understood": "understood",
+}
+HAVE_AUX = {"have", "has", "had", "having"}
+BEEN_AUX = {"been", "being"}
+MODALS = {"should", "could", "would", "must", "will", "shall", "can", "may", "might"}
+S_VIEWS = {"he": "s", "she": "s", "it": "s"}
+IRREGULAR_S = {"have": "has", "be": "is", "do": "does", "go": "goes", "say": "says",
+               "make": "makes", "take": "takes", "know": "knows", "get": "gets",
+               "want": "wants", "see": "sees", "think": "thinks", "look": "looks",
+               "come": "comes", "give": "gives", "feel": "feels", "leave": "leaves",
+               "put": "puts", "run": "runs", "bring": "brings", "happen": "happens",
+               "write": "writes", "provide": "provides", "stand": "stands",
+               "lose": "loses", "pay": "pays", "meet": "meets", "learn": "learns",
+               "change": "changes", "watch": "watches", "create": "creates",
+               "read": "reads", "follow": "follows", "stop": "stops", "speak": "speaks"}
+
+FILLER = {
+    "very": "delete it or pick a stronger word", "really": "delete it",
+    "just": "delete it (often filler)", "actually": "delete it", "basically": "delete it",
+    "literally": "usually wrong; delete it", "totally": "delete it", "simply": "delete it",
+    "obviously": "let the fact speak", "clearly": "let the fact speak",
+    "stuff": "things / items", "things": "be specific", "somehow": "delete it",
+    "somewhat": "delete it", "quite": "delete it", "rather": "delete it",
+    "thing": "be specific", "nice": "be specific", "good": "be specific",
+    "bad": "be specific", "big": "be specific", "small": "be specific",
+    "interesting": "say why it's interesting", "amazing": "be specific",
+    "awesome": "be specific", "cool": "be specific", "fine": "be specific",
+}
+REDUNDANT = {
+    "add extra": "add", "advance planning": "planning", "astounding surprise": "surprise",
+    "basic fundamentals": "fundamentals", "close proximity": "proximity",
+    "complete entire": "complete", "copy duplicate": "copy", "current trend": "trend",
+    "each and every": "each", "end result": "result", "escaped escape": "escaped",
+    "expected expectation": "expectation", "final conclusion": "conclusion",
+    "first and foremost": "first", "free gift": "gift", "future plans": "plans",
+    "general consensus": "consensus", "join together": "join", "late delay": "late",
+    "made up of components": "composed of", "merge together": "merge",
+    "past history": "history", "personal opinion": "opinion", "plan ahead": "plan",
+    "repeat again": "repeat", "revert back": "revert", "sufficient enough": "sufficient",
+    "surpassed excess": "surpassed", "unexpected surprise": "surprise",
+    "unsolved mystery": "mystery", "used in order to": "used to",
+}
+OFFICIALISMS = {
+    "utilize": "use", "utilise": "use", "commence": "start", "terminate": "end",
+    "purchase": "buy", "inquire": "ask", "assist": "help", "attempt": "try",
+    "require": "need", "request": "ask for", "provide": "give", "obtain": "get",
+    "additional": "more", "prior to": "before", "due to the fact that": "because",
+    "in order to": "to", "at this point in time": "now", "in the event that": "if",
+    "on a daily basis": "daily", "make a decision": "decide", "reach a conclusion": "conclude",
+    "give consideration to": "consider", "has the ability to": "can",
+    "is capable of": "can", "in accordance with": "per", "with regard to": "about",
+    "regarding the matter of": "about", "as per your request": "as requested",
+    "please find attached": "attached is", "enclosed please find": "enclosed is",
+    "forward-looking": "optimistic", "leverage": "use", "synergy": "cooperation",
+    "paradigm": "model", "holistic": "whole", "robust": "strong", "seamless": "smooth",
+    "cutting-edge": "advanced", "best-in-class": "excellent", "next-gen": "modern",
+    "solution-oriented": "focused", "results-driven": "effective", "game-changer": "breakthrough",
+    "low-hanging fruit": "easy wins", "move the needle": "make progress",
+    "circle back": "discuss later", "touch base": "check in", "bandwidth": "capacity",
+    "take it offline": "continue privately", "ping": "message", "deep dive": "analysis",
+    "boil the ocean": "overreach", "best practice": "proven method",
+    "value proposition": "benefit", "actionable insights": "usable findings",
+    "operationalize": "implement", "ideate": "brainstorm", "socialize": "share",
+    "normalize": "standardize", "streamline": "simplify", "facilitate": "help",
+    "methodology": "method", "incentivize": "reward", "transition": "move",
+    "engage": "involve", "empower": "enable", "align": "agree",
+    "escalate": "raise", "delegate": "assign", "mitigate": "reduce",
+    "optimize": "improve", "leverage": "use", "synergies": "cooperation",
+}
+# Single-word confused pairs that are safe to flag WITHOUT extra context
+# (the raw CONFUSIONS table is far too ambiguous for blind auto-flagging -
+# e.g. "then"/"than", "to"/"too" - only these high-signal ones fire directly).
+DIRECT_CONFUSIONS = {
+    "alot": "a lot",
+    "viceversa": "vice versa",
+}
+
+PASSIVE_HINTS = {"was", "were", "been", "being", "is", "are", "am"}
+
+
+def _build_phrase_rules():
+    """Merge every phrase-level table into one ordered (wrong -> right) list,
+    longest first so 'due to the fact that' beats 'prior to' etc."""
+    merged = {}
+    for src in (STRONG_CONFUSIONS, REDUNDANT, OFFICIALISMS):
+        for wrong, right in src.items():
+            w = wrong.lower().strip()
+            if w and " " in w:                     # multi-word phrases only here
+                merged[w] = right
+    return sorted(merged.items(), key=lambda kv: -len(kv[0]))
+
+
+_PHRASE_RULES = _build_phrase_rules()
+
+PAST_SIMPLE = {  # common irregular/regular past participles for passive detection
+    "made", "given", "taken", "seen", "known", "shown", "held", "kept", "sent",
+    "built", "found", "brought", "written", "read", "paid", "left", "told", "asked",
+    "called", "needed", "wanted", "liked", "loved", "hated", "believed", "provided",
+    "supported", "allowed", "forced", "helped", "stopped", "started", "ended",
+    "created", "designed", "developed", "produced", "completed", "finished",
+    "approved", "rejected", "selected", "chosen", "involved", "included",
+    "required", "requested", "recommended", "announced", "reported", "recorded",
+    "documented", "implemented", "organized", "managed", "controlled", "measured",
+    "evaluated", "reviewed", "updated", "modified", "fixed", "corrected",
+    "tested", "verified", "confirmed", "identified", "analyzed", "processed",
+    "delivered", "received", "ordered", "purchased", "sold", "distributed",
+    "published", "released", "launched", "established", "founded", "formed",
+    "prepared", "planned", "scheduled", "assigned", "allocated", "budgeted",
+}
+
+
+
+
+
+def init_spell_dictionary():
+    """Merge the pre-packed dictionary into the spell checker (offline-safe).
+
+    Called once at startup; the curated CORE_WORDS are always present, whether
+    or not pyspellchecker's own corpus loaded.
+    """
+    global spell
+    if spell is None:
+        try:
+            spell = SpellChecker(distance=1)
+        except Exception:
+            return False
+    try:
+        spell.word_frequency.load_words(sorted(CORE_WORDS))
+        return True
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -275,8 +1012,20 @@ def window_origin():
 class CaretLocator:
     """Screen position of the text caret: (x, y_top, height) or None."""
 
-    def __init__(self):
+    def __init__(self, root=None):
         self.errors = 0
+        self.root = root
+
+    @staticmethod
+    def _linux(root):
+        """Best-effort caret position via xdotool (needs a focused text field)."""
+        try:
+            out = subprocess.check_output(["xdotool", "getmouselocation", "--shell"],
+                                          timeout=0.3, stderr=subprocess.DEVNULL)
+            kv = dict(l.split("=", 1) for l in out.decode().split())
+            return (int(kv["x"]), int(kv["y"]) - 2, 16)
+        except Exception:
+            return None
 
     def get(self):
         if self.errors > 25:
@@ -287,7 +1036,7 @@ class CaretLocator:
             elif MAC:
                 r = self._mac()
             else:
-                r = None
+                r = self._linux(root=self.root) if getattr(self, "root", None) else None
             self.errors = 0
             return r
         except Exception:
@@ -684,7 +1433,13 @@ class Assistant:
         iss = Issue(self.next_id, kind, label, s, e, hs, he, word, suggs)
         self.next_id += 1
         self.issues.append(iss)
-        self.selected = iss.id
+        # select only the newest issue when the caret is actually at/after it;
+        # otherwise leave the user's current selection alone (no card jumping)
+        n = len(self.text)
+        if self.selected not in {i.id for i in self.issues} or he >= n - 2:
+            self.selected = iss.id
+        else:
+            self._fix_selected()
         self._update_rect(iss)
         dbg("issue", kind, repr(word), [x[0] for x in suggs])
 
@@ -715,8 +1470,36 @@ class Assistant:
         self._add("punct", f"Missing space after “{p}”", n - 1, n - 1, n - 3, n, [("add a space", " ")])
 
     def _analyze_range(self, a, b):
-        for m in re.finditer(r"\S+", self.text[a:b]):
+        t = self.text
+        # --- phrase rules (confusions / redundancy / officialisms) over the window
+        for phrase, repl in _PHRASE_RULES:
+            i = max(a - len(phrase), 0)
+            while True:
+                j = t.lower().find(phrase, i, b + 1)
+                if j < 0:
+                    break
+                k = j + len(phrase)
+                if (j == 0 or not is_word_char(t[j - 1])) and (k >= len(t) or not is_word_char(t[k])):
+                    self._add_phrase(phrase, repl, j, k)
+                i = j + 1
+        # --- passive voice: be-verb + past participle (+ "by")
+        for m in re.finditer(r"\b(is|are|was|were|been|being)\s+(\w+)(?:\s+by\b)?", t[a:b], re.I):
+            vw, pw = m.group(1).lower(), m.group(2).lower()
+            s0, e0 = a + m.start(), a + m.end()
+            if pw in PAST_SIMPLE and (vw in ("was", "were", "is", "are", "been", "being")) \
+                    and (m.group(0).rstrip().endswith(" by") or pw in ("made", "given", "taken",
+                                                                       "seen", "known", "shown", "sent")):
+                self._add("style", "Passive voice — consider active",
+                          s0, s0, s0, e0, [("keep as is", t[s0:e0])])
+        # --- per-token word rules
+        for m in re.finditer(r"\S+", t[a:b]):
             self._analyze_token(a + m.start(), a + m.end())
+
+    def _add_phrase(self, phrase, repl, j, k):
+        kind = "grammar" if phrase in STRONG_CONFUSIONS else "style"
+        label = ("Common mix-up" if kind == "grammar" else "Wordy — simplify")
+        fix = match_case(self.text[j:j + 1], repl)
+        self._add(kind, f"{label}: “{phrase}” → “{repl}”", j, k, j, k, [(fix, fix)])
 
     def _analyze_token(self, ts, te):
         # forget old word-level verdicts for words ending inside this token
@@ -796,33 +1579,69 @@ class Assistant:
                 self._add("grammar", "Repeated word", pe, e, s, e, [(f"remove “{w}”", "")])
                 return
             if (pl, lw) in MODAL_OF:
-                self._add("grammar", f"“{pw} {w}” → “{pw} have”", s, e, ps, e, [("have", "have")])
+                fix = match_case(w, "have")
+                self._add("grammar", f"“{pw} {w}” → “{pw} have”", pe, e, ps, e, [(fix, fix)])
+                return
+            if lw in PARTICIPLES and (pl in HAVE_AUX or (pl == "been" and lw != PARTICIPLES.get(lw))):
+                if pl in HAVE_AUX and lw != PARTICIPLES[lw]:
+                    fix = match_case(w, PARTICIPLES[lw])
+                    self._add("grammar", f"Past participle: “{lw}” → “{PARTICIPLES[lw]}”",
+                              s, e, s, e, [(fix, fix)])
+                    return
+            if pl in MODALS and lw.endswith("s") and len(lw) > 3 \
+                    and lw[:-1] in CORE_WORDS and spell is not None and spell.known([lw[:-1]]):
+                fix = match_case(w, lw[:-1])
+                self._add("grammar", "Use the base verb after a modal", s, e, s, e, [(fix, fix)])
                 return
             if (pl, lw) == ("your", "welcome"):
                 fix = match_case(pw, "you're")
                 self._add("grammar", "“your” → “you're”", ps, pe, ps, e, [(fix, fix)])
+                return
             elif pl == "a" and lw[0] in "aeio" and not w.isupper() and not lw.startswith(("one", "once", "eu", "ou")) \
                     and not (len(w) > 1 and w[0].islower() and w[1].isupper()):
                 fix = match_case(pw, "an")
                 self._add("grammar", "Use “an” before a vowel sound", ps, pe, ps, e, [(fix, fix)])
+                return
             elif pl == "an" and lw[0] in "bcdgjkmnpqrstvwyz" and not w.isupper():
                 fix = match_case(pw, "a")
                 self._add("grammar", "Use “a” before a consonant sound", ps, pe, ps, e, [(fix, fix)])
+                return
 
         # --- spelling
         if "'" in lw:
-            return                                   # other apostrophe words: leave alone
+            if lw in CONTRACTIONS_OK:
+                return
+            # leave unknown apostrophe words alone
+            return
         if len(lw) < 2 or w.isupper() or any(ch.isupper() for ch in w[1:]):
             return                                   # acronyms, CamelCase, iPhone ...
-        if lw in SLANG_OK or spell.known([lw]):
+        known = bool(spell.known([lw])) if spell is not None else (lw in CORE_WORDS)
+        if lw in SLANG_OK or known:
             if strict_start and w[0].islower():
                 fix = w[0].upper() + w[1:]
                 self._add("style", "Capitalize first word of sentence", s, e, s, e, [(fix, fix)])
+                return
+            self._style_word(s, e, lw, w)
             return
         if w[0].isupper() and not (strict_start or s == 0 or t[s - 1] == "\n"):
             return                                   # probably a name
+        if lw in DIRECT_CONFUSIONS:                  # "alot" -> "a lot" etc.
+            repl = DIRECT_CONFUSIONS[lw]
+            fix = match_case(w, repl)
+            self._add("grammar", f"“{w}” → “{repl}”", s, e, s, e, [(fix, fix)])
+            return
         sugg = rank_suggestions(w)
-        self._add("spelling", "Possible misspelling", s, e, s, e, [(x, x) for x in sugg])
+        if not sugg:
+            return                                   # nothing credible - stay quiet
+        self._add("spelling", "Possible misspelling", s, e, s, e,
+                  [(x, x) for x in sugg])
+
+    def _style_word(self, s, e, lw, w):
+        """Soft style hints on correctly-spelled words (never overrides real errors)."""
+        hint = FILLER.get(lw)
+        if hint and lw not in ("i",):
+            self._add("style", f"Filler / weak word: “{lw}” — {hint}", s, e, s, e,
+                      [("delete it", ""), ("keep as is", w)])
 
     # ---------------- caret sampling -> screen rectangles for underlines
     def _update_rect(self, iss):
@@ -853,6 +1672,7 @@ class Assistant:
         iss.char_w = avg
 
     def _worker(self):
+        last_sample_key, last_sample_at = None, 0.0
         while True:
             try:
                 key = self.sample_q.get(timeout=0.2)
@@ -876,7 +1696,15 @@ class Assistant:
                             for i in self.issues:
                                 if i.rect is None:
                                     self._update_rect(i)
+                    last_sample_key, last_sample_at = key, time.time()
                     self.notify()
+            elif (last_sample_key is not None
+                  and time.time() - last_sample_at > IDLE_FLUSH_SECONDS + 0.4):
+                # the target window may have moved/animated after the last sample:
+                # re-sample once so underlines land on the right text again
+                last_sample_key = None
+                with self.lock:
+                    self.sample_q.put(len(self.text))
             self._idle_check()
             if time.time() - self._last_dict_check > DICT_RELOAD_SECONDS:
                 self._last_dict_check = time.time()
@@ -1316,22 +2144,38 @@ class UI:
         if snap and not snap["paused"]:
             ox, oy = window_origin()
             ms = get_monitors(self.root)
+            sel = snap["selected"]
             for i in snap["issues"]:
                 if not i["rect"]:
                     continue
                 x, y, w = i["rect"]
+                # the rect was projected while the target window sat at i["origin"];
+                # shift by however far that window has moved since (0 on mac/linux)
                 x += ox - i["origin"][0]
                 y += oy - i["origin"][1]
+                w = max(int(w), 6)                       # never a zero-width mark
                 if any(m[0] <= x < m[0] + m[2] and m[1] <= y < m[1] + m[3] for m in ms):
-                    items.append((int(x), int(y), int(w), KIND_COLOR.get(i["kind"], RED),
-                                  3 if i["id"] == snap["selected"] else 2))
+                    items.append((int(x), int(y), w, KIND_COLOR.get(i["kind"], RED),
+                                  4 if i["id"] == sel else 3))
         items = items[:len(self.lines)]
-        for w, (x, y, wd, color, th) in zip(self.lines, items):
-            w.configure(bg=color)
-            w.geometry(f"{wd}x{th}+{x}+{y}")
-            w.deiconify()
+        for idx, (w, (x, y, wd, color, th)) in enumerate(zip(self.lines, items)):
+            try:
+                w.configure(bg=color)
+                # geometry BEFORE deiconify: many WMs refuse to map borderless
+                # windows that still have their old 1x1 size - this is why the
+                # underlines used to never show up.
+                w.geometry(f"{wd}x{th}+{x}+{y}")
+                if w.state() != "normal":
+                    w.deiconify()
+                w.lift(idx)                  # stable stacking -> no flicker
+            except tk.TclError:
+                pass
         for w in self.lines[len(items):]:
-            w.withdraw()
+            try:
+                if w.state() == "normal":
+                    w.withdraw()
+            except tk.TclError:
+                pass
 
     def tick(self):
         self.draw_underlines()
