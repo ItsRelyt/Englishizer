@@ -2,7 +2,7 @@
 title Python Setup and Execution
 
 echo Installing required Python packages to user space...
-python -m pip install --user pynput pyspellchecker
+python -m pip install --user pynput pyspellchecker uiautomation
 
 echo.
 echo Running writing_assistant.py...
