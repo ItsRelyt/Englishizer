@@ -795,15 +795,17 @@ class Lexicon:
         return self.freq.get(lw, 1 if lw in self.user else 0)
 
     # ---- suggestions
-    def suggest(self, word: str, limit: int = 4):
+    def suggest(self, word: str, limit: int = 4, deadline: float = 0.0):
         """[(candidate, score)] best first. Lower score = better. Cached."""
         lw = word.lower().replace("\u2019", "'")
         hit = self._cache.get(lw)
         if hit is None:
-            hit = self._suggest(lw)
-            if len(self._cache) > 3000:
-                self._cache.clear()
-            self._cache[lw] = hit
+            complete = [True]
+            hit = self._suggest(lw, deadline, complete)
+            if complete[0]:                              # incomplete (out of time) results are retried later
+                if len(self._cache) > 3000:
+                    self._cache.clear()
+                self._cache[lw] = hit
         out, seen = [], set()
         for c, sc in hit:
             cc = match_case(word, c)
@@ -825,7 +827,7 @@ class Lexicon:
         f = self.f(c)
         return cost * 2.0 - math.log10(1 + f) * 0.5
 
-    def _suggest(self, lw: str):
+    def _suggest(self, lw: str, deadline: float = 0.0, complete=None):
         if not lw.isalpha() or len(lw) > 24:
             return []
         scored: dict = {}
@@ -838,6 +840,10 @@ class Lexicon:
             for c in k1:
                 scored.setdefault(c, self._score(lw, c, 1))
             need2 = (not k1 or max(self.f(c) for c in k1) < 1000) and len(lw) >= 4 and len(lw) <= 13
+            if need2 and deadline and time.time() > deadline:
+                need2 = False
+                if complete is not None:
+                    complete[0] = False
             if need2:
                 seen = set(e1)
                 for e in e1:
@@ -915,6 +921,26 @@ def load_all_dictionaries() -> set:
     except Exception:
         pass
     return words
+
+
+IGNORED_FILE = HOME_DIR / "ignored.txt"
+
+
+def load_ignored() -> list:
+    """Issues you chose to ignore (one 'rule|text' per line); delete the file to reset."""
+    try:
+        return [l.strip() for l in IGNORED_FILE.read_text(encoding="utf-8").splitlines() if "|" in l][:5000]
+    except Exception:
+        return []
+
+
+def save_ignored(tag: str) -> None:
+    try:
+        HOME_DIR.mkdir(parents=True, exist_ok=True)
+        with open(IGNORED_FILE, "a", encoding="utf-8") as f:
+            f.write(tag.replace("\n", " ") + "\n")
+    except Exception as ex:
+        dbg("could not save ignore:", ex)
 
 
 def import_dictionaries(paths) -> None:
@@ -997,7 +1023,8 @@ WORD_RE = re.compile(r"[A-Za-z]+(?:['\u2019][A-Za-z]+)*")
 CHUNK_RE = re.compile(r"\S+")
 DOMAINISH = re.compile(r"[A-Za-z0-9]\.[a-z]{2,4}(?:\b|/)")
 
-CONS_SOUND_VOWEL_LETTER = ("one", "once", "eu", "ewe", "use", "usu", "uti", "ubiq", "uk", "ura")
+CONS_SOUND_VOWEL_LETTER = ("one", "once", "eu", "ewe", "use", "usu", "usa", "uti", "ubiq", "uk", "ura",
+                           "unanim", "urin", "uku")
 VOWEL_SOUND_H = {"hour", "hours", "hourly", "honest", "honestly", "honor", "honour", "honors",
                  "honorable", "honourable", "honorary", "heir", "heirs", "heiress"}
 CAUSATIVE = {"let", "lets", "make", "makes", "made", "help", "helps", "helped", "watch",
@@ -1010,7 +1037,9 @@ CAUSATIVE = {"let", "lets", "make", "makes", "made", "help", "helps", "helped", 
              "do", "does", "did", "can", "could", "will", "would", "shall", "should", "may",
              "might", "must", "has", "is", "was", "are", "were", "am", "be", "been",
              "dont", "don't", "doesn't", "didn't", "won't", "can't", "couldn't", "wouldn't",
-             "shouldn't", "how", "what", "why", "where", "when", "who", "whom"}
+             "shouldn't", "how", "what", "why", "where", "when", "who", "whom",
+             "feel", "felt", "notice", "noticed", "imagine", "prefer", "like", "liked", "love",
+             "loved", "hate", "wish", "bet", "stop", "prevent", "find", "found"}
 HAVE_FORMS = {"have", "has", "had", "haven't", "hasn't", "hadn't"}
 
 PARTICIPLES = {
@@ -1100,7 +1129,7 @@ R("your-youre", "grammar",
 R("your-youre2", "grammar", r"\b(your)<S>(right|wrong|correct)(?=[ \t]*[.,!?]|[ \t]+(?:about|that|and|but)\b|[ \t]*$)",
   r"you're \2", "“{old}” → “{new}” (you are)")
 R("its-itis", "grammar",
-  r"\b(its)<S>(a|an|been|not|going|just|very|so|too|really|always|never|also|still|only|all|the|like|because|what)\b" + NOT_COMP,
+  r"\b(its)<S>(a|an|been|not|going<S>to|just|so|too|really|always|never|also|still|the|like|because|what)\b" + NOT_COMP,
   r"it's \2", "“{old}” → “{new}” (it is / it has)")
 R("itis-its", "grammar", r"\b(it's|it\u2019s)<S>own\b", "its own", "“{old}” → “{new}” (possessive)")
 R("their-there", "grammar",
@@ -1115,8 +1144,8 @@ R("then-than", "grammar",
 R("and-then", "grammar", r"\b(and)<S>than\b", r"\1 then", "“{old}” → “{new}” (sequence)")
 R("to-too", "grammar",
   r"\b(is|was|are|were|be|am|it's|that's|isn't|wasn't|seems|looks|feels|getting|gets|get)<S>to<S>"
-  r"(late|early|soon|big|small|long|short|hard|easy|old|young|expensive|cold|hot|fast|slow|much|many|few|little|"
-  r"close|far|loud|quiet|bright|dark|heavy|light|bad|good|busy|tired|risky|dangerous|difficult|complicated|simple|high|low)\b",
+  r"(late|early|soon|big|small|hard|easy|old|young|expensive|cold|hot|much|many|few|little|"
+  r"far|loud|bright|heavy|bad|good|busy|tired|risky|dangerous|difficult|complicated|high|low)\b" + NOT_COMP,
   r"\1 too \2", "“{old}” → “{new}” (excessively)")
 R("too-to", "grammar",
   r"\b(going|want|wanted|need|needed|have|had|able|trying|try|tried|like|love)<S>too<S>"
@@ -1276,13 +1305,13 @@ def article_problem(a: str, nxt: str):
     if not nxt.isalpha() or nxt.isupper() or len(nxt) < 2:
         return None
     ln = nxt.lower()
-    if ln in ("herb", "herbs", "herbal", "an", "the"):
+    if ln in ("herb", "herbs", "herbal", "an", "the", "historic", "historical", "historically"):
         return None
     if ln in VOWEL_SOUND_H:
         vowel = True
     elif ln[0] in "aeiou":
         vowel = True
-        if ln.startswith(CONS_SOUND_VOWEL_LETTER[:6]) or ln.startswith(CONS_SOUND_VOWEL_LETTER[6:8]):
+        if ln.startswith(CONS_SOUND_VOWEL_LETTER):
             vowel = False
         if ln.startswith("uni") and len(ln) > 3 and ln[3] not in "nmd":
             vowel = False
@@ -1297,6 +1326,7 @@ def check_text(text: str, *, lex: Lexicon = None, cfg: dict = None, start_is_sen
     """All issues in `text`, sorted by position. `active` = span being typed (skipped)."""
     lex = lex or LEX
     cfg = cfg or CFG
+    t_budget = time.time() + 2.0                     # cap on time spent generating suggestions
     level = LEVELS.get(cfg.get("style_level", "standard"), 2)
     n = len(text)
     if not n:
@@ -1417,7 +1447,7 @@ def check_text(text: str, *, lex: Lexicon = None, cfg: dict = None, start_is_sen
             add("grammar", "cap-name", "Capitalize days and months", s, e, s, e, [w.capitalize()], True)
             continue
         sent_start = sentence_start_at(text, s, start_is_sentence)
-        spell = _spelling_issue(w, lw, s, e, text, lex, cfg, sent_start, counts[lw])
+        spell = _spelling_issue(w, lw, s, e, text, lex, cfg, sent_start, counts[lw], t_budget)
         if spell:
             out.append(spell)
             continue
@@ -1459,7 +1489,8 @@ def check_text(text: str, *, lex: Lexicon = None, cfg: dict = None, start_is_sen
     return kept
 
 
-def _spelling_issue(w, lw, s, e, text, lex: Lexicon, cfg: dict, sent_start: bool, repeats: int = 1):
+def _spelling_issue(w, lw, s, e, text, lex: Lexicon, cfg: dict, sent_start: bool, repeats: int = 1,
+                    deadline: float = 0.0):
     pref = cfg.get("spelling", "any")
 
     def mk(msg, sugg, auto):
@@ -1469,7 +1500,7 @@ def _spelling_issue(w, lw, s, e, text, lex: Lexicon, cfg: dict, sent_start: bool
 
     if lw in TYPO_MAP:
         fix = match_case(w, TYPO_MAP[lw])
-        return mk("Common misspelling", [fix] + [c for c, _ in lex.suggest(w, 3) if c != fix][:2], True)
+        return mk("Common misspelling", [fix] + [c for c, _ in lex.suggest(w, 3, deadline) if c != fix][:2], True)
     if "'" in lw:
         return None                                  # contractions/possessives: leave alone
     if len(lw) < 2 or w.isupper() or any(c.isupper() for c in w[1:]) or re.search(r"(.)\1\1", lw):
@@ -1496,7 +1527,7 @@ def _spelling_issue(w, lw, s, e, text, lex: Lexicon, cfg: dict, sent_start: bool
         return None                                  # tiny list: only the curated typo table is trusted
     if w[0].isupper() and not sent_start:
         return None                                  # probably a name
-    sg = lex.suggest(w, 4)
+    sg = lex.suggest(w, 4, deadline)
     if not sg:
         return None
     best = sg[0]
@@ -1972,7 +2003,7 @@ class Assistant:
         self.start_sentence = False          # is buffer start known to be a sentence start?
         self.issues: list = []
         self.selected: Optional[str] = None
-        self.ignored: set = set()
+        self.ignored: set = set(load_ignored())
         self.rev = 0
         self.checked_part = self.checked_full = -1
         self.last_edit = time.time()
@@ -2115,6 +2146,7 @@ class Assistant:
                 return
             tag = f"{it.rule}|{it.word.lower()}"
             self.ignored.add(tag)
+            save_ignored(tag)
             self.issues = [i for i in self.issues if f"{i.rule}|{i.word.lower()}" != tag]
             self._ensure_selection()
         self.notify()
@@ -2400,7 +2432,7 @@ class Assistant:
             go = False
             if self.want_sync and now >= self.want_sync and idle >= 0.12:
                 self.want_sync, go = 0.0, True
-            elif self.field_ok and idle >= 0.45 and (self.verified_rev != self.rev or now - self.last_verify > 4.0):
+            elif self.field_ok and idle >= 0.45 and (self.verified_rev != self.rev or now - self.last_verify > 5.0):
                 go = True
         if go:
             self.sync_event.set()
@@ -2732,7 +2764,7 @@ class Assistant:
             self.toast("Stopped for safety — re-checking the field")
             return
         finally:
-            self.inject_until = time.time() + 0.5
+            self.inject_until = time.time() + 0.12
             with self.lock:
                 self.injecting = False
                 self._bump()
@@ -2842,6 +2874,9 @@ class Keys:
                 return
         name = getattr(key, "name", "")
         if name in IGNORED_KEY_NAMES:
+            return
+        if MAC and self.held("alt") and not (getattr(key, "char", None) and key.char.isprintable()):
+            m.invalidate()                     # Option+Arrow / Option+Backspace jump by words
             return
         shift = self.held("shift")
         if key == Key.space:
